@@ -7,6 +7,7 @@
 
 #include <mgba/internal/arm/isa-inlines.h>
 #include <mgba/internal/arm/macros.h>
+#include <mgba/internal/gba/bios-frlg-reva.h>
 #include <mgba/internal/gba/gba.h>
 #include <mgba/internal/gba/io.h>
 #include <mgba/internal/gba/memory.h>
@@ -586,6 +587,9 @@ void GBASwi16(struct ARMCore* cpu, int immediate) {
 	case GBA_SWI_SOUND_DRIVER_GET_JUMP_LIST:
 		ARMRaiseSWI(cpu);
 		return;
+	case GBA_SWI_FRLG_REVA_FLASH_WRITE:
+		GBABiosFRLGRevAFlashWrite(gba);
+		break;
 	default:
 		mLOG(GBA_BIOS, STUB, "Stub software interrupt: %02X", immediate);
 	}

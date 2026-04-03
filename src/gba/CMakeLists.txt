@@ -3,6 +3,7 @@ set(SOURCE_FILES
 	../gb/audio.c
 	audio.c
 	bios.c
+	bios-frlg-reva.c
 	cart/ereader.c
 	cart/gpio.c
 	cart/matrix.c

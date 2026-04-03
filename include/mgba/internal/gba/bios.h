@@ -62,6 +62,9 @@ enum GBASwi {
 	GBA_SWI_SOUND_DRIVER_VSYNC_OFF = 0x28,
 	GBA_SWI_SOUND_DRIVER_VSYNC_ON = 0x29,
 	GBA_SWI_SOUND_DRIVER_GET_JUMP_LIST = 0x2A,
+
+	/* FireRed/LeafGreen RevA custom SWIs (range 0x44-0x62, non-standard) */
+	GBA_SWI_FRLG_REVA_FLASH_WRITE = 0x48,
 };
 
 struct ARMCore;
