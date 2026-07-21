@@ -1,3 +1,160 @@
+# FRLG RevA Save Fix (mGBA fork)
+
+The Nintendo Switch versions of Pokémon FireRed and LeafGreen run inside a custom emulator rather than being true ports. Nintendo also modified the ROM into a new **RevA** release (the original revisions are 0 and 1), adding several emulator-specific system calls for functionality such as saving, telemetry, and player/nickname censorship.
+
+These new system calls are outside the normal GBA SWI range, so standard emulators treat them as no-ops. As a result, the games appear to run normally, but saving silently fails.
+
+There is one good reason to play these newer revisions: after entering the Hall of Fame, the game awards the **Mystic Ticket** and **Aurora Ticket**, allowing legitimate access to Ho-Oh, Lugia, and Deoxys without cheats.
+
+This fork restores saving support for FireRed (and likely LeafGreen) by implementing the custom save SWI expected by RevA.
+
+## Findings
+
+The Switch emulator actually contains the real save implementation, presumably for Switch save integration and displaying save progress. I first learned about this from [this post](https://x.com/meatball_132/status/2027448876098326893?s=46).
+
+From there, I dug through the ROM and compared it against the original FireRed source (see [pokefirered](https://github.com/pret/pokefirered)). The root cause is surprisingly small:
+
+RevA replaces the normal flash write routine (`ProgramFlashSectorAndVerify`) with a wrapper around **SWI 0x48** inside `TryWriteSector`.
+
+SWI `0x48` is part of a larger collection of non-standard SWIs (0x44–0x62) injected throughout RevA. Most of them appear to be related to telemetry or Switch-specific features and do not affect gameplay.
+
+| SWI      | Trigger                    | Notes                                                                      |
+| -------- | -------------------------- | -------------------------------------------------------------------------- |
+| 0x44     | Game boot                  | Called once during startup                                                 |
+| **0x48** | **Flash sector write**     | Used by the emulator for save writes; implemented by this fork             |
+| 0x4C     | Save completion            | Called once after all save sectors are written                             |
+| 0x4D     | Player/rival naming        | Censorship check; likely responsible for naming issues                     |
+| 0x55     | Map changes, battles, boot | Frequent; likely telemetry                                                 |
+| 0x57     | Pokémon received           | Called whenever a Pokémon is obtained; may be related to nickname handling |
+
+This is **not** an exhaustive list, only the SWIs I encountered while debugging.
+
+This fork only implements **SWI 0x48**, since the others do not make the game unplayable. I may eventually look into fixing player naming as well.
+
+For those interested, the implementation simply reproduces the flash write expected by RevA:
+
+* Reads `r0` (sector number, 0–13)
+* Reads `r1` (pointer to the 4 KB sector data)
+* Writes the sector into mGBA's save buffer
+* Marks the save as dirty so it is flushed to disk
+
+This implementation also appears to work for LeafGreen.
+
+For actually using the emulator, see the README.
+
+---
+
+### RevA save wrapper
+
+```arm
+; File offset 0xC754 — GBA address 0x0800C754
+; Replaces ProgramFlashSectorAndVerify
+
+C754: 30 B5       push {r4, r5, lr}
+C756: 04 1C       mov r4, r0
+C758: 0D 1C       mov r5, r1
+C75A: 24 06       lsls r4, #24
+C75C: 24 0E       lsrs r4, #24
+C75E: 20 1C       mov r0, r4
+C760: 29 1C       mov r1, r5
+C762: 48 DF       svc #0x48
+C764: 30 BC       pop {r4, r5}
+C766: 01 BC       pop {r0}
+C768: 00 47       bx r0
+C76A: 00 00
+```
+
+### Save call chain
+
+```
+SaveDialogCB_DoSave
+  → TrySavingData
+    → HandleSavingData
+      → WriteSaveSectorOrSlot
+        → HandleWriteSector
+          → TryWriteSector
+            → bl 0x0800C754
+              → svc #0x48
+```
+
+The rest of the save code is essentially identical to the original games.
+
+| Function                                                    | Offset              | Notes                                        |
+| ----------------------------------------------------------- | ------------------- | -------------------------------------------- |
+| `SaveDialogCB_PrintAskOverwriteText`                        | `0x072FE8`          | Identical                                    |
+| `SaveDialogCB_AskOverwritePrintYesNoMenu`                   | `0x073010`          | Identical                                    |
+| `SaveDialogCB_AskReplacePreviousFilePrintYesNoMenu`         | `0x07302C`          | Identical                                    |
+| `SaveDialogCB_AskOverwriteOrReplacePreviousFileHandleInput` | `0x073048`          | Identical                                    |
+| `SaveDialogCB_PrintSavingDontTurnOffPower`                  | `0x073090`          | Identical                                    |
+| `SaveDialogCB_DoSave`                                       | `0x0730AC`          | Identical                                    |
+| `SaveDialogCB_PrintSaveResult`                              | `0x0730E8`          | Identical                                    |
+| `TrySavingData`                                             | `0x0DDA5C`          | Identical                                    |
+| `HandleSavingData`                                          | `0x0DD93C`          | Modified — extra `bl` inserted before return |
+| Static save helpers                                         | `0x0DD13C–0x0DD93C` | Structure matches                            |
+| `UpdateSaveAddresses`                                       | Near `0x0DD900`     | Identical                                    |
+
+Since the original save implementation is still present in the ROM but simply no longer used, saving can also be restored with a small ROM patch.
+
+At offset `0x0C762`, replace the custom SWI with a call back into the original flash write routine:
+
+```text
+Offset    Before              After
+0xC762    48 DF               D6 F1
+0xC764    30 BC               05 F8
+0xC766    01 BC               30 BC
+0xC768    00 47               01 BC
+0xC76A    00 00               00 47
+```
+
+```arm
+; BEFORE
+C762: 48 DF         svc #0x48
+C764: 30 BC         pop {r4, r5}
+C766: 01 BC         pop {r0}
+C768: 00 47         bx r0
+
+; AFTER
+C762: D6 F1 05 F8   bl ProgramFlashSector_MX
+C766: 30 BC         pop {r4, r5}
+C768: 01 BC         pop {r0}
+C76A: 00 47         bx r0
+```
+
+`ProgramFlashSector_MX` is not the exact function originally called by FireRed, but it is compatible here and restores working saves.
+
+---
+
+## Other custom SWIs
+
+For completeness, these are the other RevA wrappers I found.
+
+| Offset    | SWI      | Signature               | Purpose                          |
+| --------- | -------- | ----------------------- | -------------------------------- |
+| `0x0C690` | 0x41     | `(void)`                | Unknown                          |
+| `0x0C694` | 0x47     | `(data)`                | Copies data + SWI, updates state |
+| `0x0C6D4` | 0x42     | `(void)`                | Unknown                          |
+| `0x0C6D8` | 0x49     | `(void) → r0`           | Returns value                    |
+| `0x0C6E8` | 0x45     | `(ptr)`                 | Loads from RAM, calls SWI        |
+| `0x0C6FC` | 0x4A     | `(void) → r0`           | Returns value                    |
+| `0x0C70C` | 0x43     | `(u16)`                 | Takes a 16-bit argument          |
+| `0x0C720` | **0x44** | `(void)`                | Game boot                        |
+| `0x0C724` | 0x53     | `(void) → r0`           | Returns value                    |
+| `0x0C734` | 0x51     | `(void) → r0`           | Returns value                    |
+| `0x0C744` | 0x4B     | `(void) → r0`           | Returns value                    |
+| `0x0C754` | **0x48** | `(u8 sector, u8* data)` | Flash sector write               |
+| `0x0C76C` | 0x56     | `(u8, ptr)`             | Similar to 0x48                  |
+| `0x0C784` | **0x4C** | `(void)`                | Save completion                  |
+| `0x0C788` | 0x54     | `(void) → r0`           | Returns value                    |
+| `0x0C798` | **0x4D** | `(args) → r0`           | Player/rival naming              |
+| `0x0C7C8` | 0x4F     | `(r0)`                  | Unknown                          |
+| `0x0C7D0` | 0x50     | `(void) → r0`           | Returns value                    |
+| `0x0C7DA` | **0x55** | `(r0)`                  | Location/telemetry               |
+| `0x0C7E4` | **0x57** | `(r0)`                  | Pokémon received                 |
+| `0x0C7EE` | 0x61     | `(r0)`                  | Unknown                          |
+| `0x0C7F4` | 0x62     | `(void)`                | Unknown                          |
+
+---
+
 mGBA
 ====
 
