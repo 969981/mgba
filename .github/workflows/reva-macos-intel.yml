@@ -1,0 +1,64 @@
+name: Build FRLG RevA macOS Intel release
+
+on:
+  push:
+    branches:
+      - revA-bootstrap
+    paths:
+      - .github/workflows/reva-macos-intel.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  REV_SHA: fadbf93a565a5bd0b3e7f12b848fc208064a94f1
+  RELEASE_TAG: revA-20260930
+
+jobs:
+  macos:
+    name: macOS Intel release
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revA
+          fetch-depth: 0
+      - name: Verify source
+        run: test "$(git rev-parse HEAD)" = "$REV_SHA"
+      - name: Install dependencies
+        run: |
+          set -euxo pipefail
+          brew update
+          brew install cmake ninja qt@5 sdl2 ffmpeg libzip libepoxy lua
+          echo "$(brew --prefix qt@5)/bin" >> "$GITHUB_PATH"
+      - name: Build and package DMG
+        run: |
+          set -euxo pipefail
+          export PATH="$(brew --prefix qt@5)/bin:$PATH"
+          export CMAKE_PREFIX_PATH="$(brew --prefix qt@5)"
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDISTBUILD=ON \
+            -DBUILD_STATIC=ON \
+            -DBUILD_SHARED=OFF \
+            -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH"
+          cmake --build build --parallel 2
+          (cd build && cpack -G DragNDrop)
+          DMG=$(find build -maxdepth 1 -type f -name '*.dmg' | head -n1)
+          test -n "$DMG"
+          cp "$DMG" mGBA-FRLG-RevA-macos-intel.dmg
+          ls -lh mGBA-FRLG-RevA-macos-intel.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-intel-release
+          path: mGBA-FRLG-RevA-macos-intel.dmg
+          if-no-files-found: error
+      - name: Publish macOS asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+          gh release upload "$RELEASE_TAG" mGBA-FRLG-RevA-macos-intel.dmg --repo "$GITHUB_REPOSITORY" --clobber
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json url,tagName,assets
