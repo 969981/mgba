@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - revA-bootstrap
-    paths:
-      - .github/workflows/reva-all-platforms.yml
   workflow_dispatch:
 
 permissions:
