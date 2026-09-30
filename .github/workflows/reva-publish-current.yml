@@ -1,0 +1,44 @@
+name: Publish successful FRLG RevA platform artifacts
+
+on:
+  push:
+    branches:
+      - revA-bootstrap
+    paths:
+      - .github/workflows/reva-publish-current.yml
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+env:
+  RELEASE_TAG: revA-20260930
+  SOURCE_RUN_ID: 36677127080
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download successful platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          find release-assets -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+          test -f release-assets/mGBA-FRLG-RevA-linux-x64.tar.xz
+          test -f release-assets/mGBA-FRLG-RevA-switch.7z
+          test -f release-assets/mGBA-FRLG-RevA-wii.7z
+          for f in release-assets/*; do
+            gh release upload "$RELEASE_TAG" "$f" --repo "$GITHUB_REPOSITORY" --clobber
+          done
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json url,tagName,assets
