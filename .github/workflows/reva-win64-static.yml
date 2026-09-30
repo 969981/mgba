@@ -1,4 +1,4 @@
-# RevA Windows static release pipeline v3: UCRT64 + real GUI launch gate
+# RevA Windows static release pipeline v4: UCRT64 + restored SQLite3 + real GUI launch gate
 name: Build and publish FRLG RevA static Windows x64
 
 on:
@@ -38,6 +38,21 @@ jobs:
           if ($actual -ne $env:EXPECTED_REVA) { throw "RevA source mismatch: $actual" }
           git log --oneline --decorate -3
 
+      - name: Apply static-startup safety guard
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = 'src/platform/qt/Window.cpp'
+          $text = [IO.File]::ReadAllText($path)
+          $old = "`tcentralWidget()->unsetCursor();"
+          $new = "`tif (centralWidget()) {`n`t`tcentralWidget()->unsetCursor();`n`t}"
+          $count = ([regex]::Matches($text, [regex]::Escape($old))).Count
+          if ($count -ne 1) { throw "Expected exactly one centralWidget()->unsetCursor() site, found $count" }
+          $text = $text.Replace($old, $new)
+          [IO.File]::WriteAllText($path, $text, [Text.UTF8Encoding]::new($false))
+          git diff --check
+          git diff -- src/platform/qt/Window.cpp
+
       - name: Set up UCRT64 static toolchain
         uses: msys2/setup-msys2@v2
         with:
@@ -54,6 +69,7 @@ jobs:
             mingw-w64-ucrt-x86_64-zlib
             mingw-w64-ucrt-x86_64-zstd
             mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-sqlite3
 
       - name: Configure static UCRT64 distribution build
         shell: msys2 {0}
@@ -67,15 +83,19 @@ jobs:
           SDL2_STATIC=/ucrt64/lib/libSDL2.a
           SDL2MAIN_STATIC=/ucrt64/lib/libSDL2main.a
           EPOXY_STATIC=/ucrt64/lib/libepoxy.a
+          SQLITE_STATIC=/ucrt64/lib/libsqlite3.a
 
-          for lib in "$QTPNG" "$ZLIB_STATIC" "$SDL2_STATIC" "$SDL2MAIN_STATIC" "$EPOXY_STATIC"; do
+          for lib in "$QTPNG" "$ZLIB_STATIC" "$SDL2_STATIC" "$SDL2MAIN_STATIC" "$EPOXY_STATIC" "$SQLITE_STATIC"; do
             test -f "$lib" || { echo "Required static library missing: $lib" >&2; exit 1; }
             ls -lh "$lib"
           done
 
+          # Keep every direct runtime dependency static. In particular, restoring
+          # SQLite3 also restores the normal startup path that attaches a central
+          # widget before Window::setLogo() runs.
           HIDDEN=/ucrt64/lib/.reva-hidden-import-libs
           mkdir -p "$HIDDEN"
-          for name in png16 ssl crypto zstd z SDL2 epoxy; do
+          for name in png16 ssl crypto zstd z SDL2 epoxy sqlite3; do
             imp="/ucrt64/lib/lib${name}.dll.a"
             if [[ -f "$imp" ]]; then
               echo "Hiding DLL import library: $imp"
@@ -109,6 +129,9 @@ jobs:
             -DPNG_LIBRARY="$QTPNG" \
             -DPNG_LIBRARY_RELEASE="$QTPNG" \
             -DPNG_PNG_INCLUDE_DIR=/ucrt64/include \
+            -DUSE_SQLITE3=ON \
+            -DSQLite3_LIBRARY="$SQLITE_STATIC" \
+            -DSQLite3_INCLUDE_DIR=/ucrt64/include \
             -DSDL2_LIBRARIES_TEMP="$SDL2_STATIC" \
             -DSDL2MAIN_LIBRARY="$SDL2MAIN_STATIC" \
             -DUSE_MINIZIP=OFF \
@@ -117,9 +140,11 @@ jobs:
             -DUSE_LZMA=OFF \
             -DUSE_ELF=OFF \
             -DUSE_LUA=OFF \
-            -DUSE_SQLITE3=OFF \
             -DUSE_JSON_C=OFF \
             -DUSE_DISCORD_RPC=OFF
+
+          echo '==== SQLite configuration ===='
+          grep -Ei '^(USE_SQLITE3|SQLite3_|SQLITE3_).*=' build-static/CMakeCache.txt || true
 
       - name: Build static Windows targets
         shell: msys2 {0}
@@ -140,7 +165,7 @@ jobs:
             echo "==== $exe imports ===="
             imports=$(objdump -p "$exe" | awk '/DLL Name:/ {print $3}')
             printf '%s\n' "$imports"
-            if printf '%s\n' "$imports" | grep -Eqi '(^|/)(Qt[56]|SDL2|libepoxy|libpng|zlib|zlib1|libzstd|libgcc|libstdc\+\+|libwinpthread|libcrypto|libssl).*\.dll$'; then
+            if printf '%s\n' "$imports" | grep -Eqi '(^|/)(Qt[56]|SDL2|libepoxy|libpng|zlib|zlib1|libzstd|libgcc|libstdc\+\+|libwinpthread|libcrypto|libssl|sqlite3).*\.dll$'; then
               echo "Unexpected non-system runtime dependency in $exe"
               bad=1
             fi
@@ -181,8 +206,8 @@ jobs:
             Start-Sleep -Seconds 10
             $p.Refresh()
             if ($p.HasExited) { throw "mGBA GUI exited early with code $($p.ExitCode)" }
-            if ($p.MainWindowHandle -eq 0) { Write-Host 'Process alive; GUI handle not yet exposed by runner.' }
-            Write-Host "GUI launch gate passed. PID=$($p.Id)"
+            if ($p.MainWindowHandle -eq 0) { throw 'mGBA process is alive but no GUI window handle was created' }
+            Write-Host "GUI launch gate passed. PID=$($p.Id) MainWindowHandle=$($p.MainWindowHandle)"
           } finally {
             if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
             $env:PATH = $oldPath
@@ -224,6 +249,6 @@ jobs:
           if ($tagSha -ne $env:EXPECTED_REVA) { throw "Tag $tag points to $tagSha, expected $env:EXPECTED_REVA" }
           gh release upload $tag $asset --repo $repo --clobber
           if ($LASTEXITCODE -ne 0) { throw 'Release upload failed' }
-          gh release edit $tag --repo $repo --notes 'FRLG RevA multi-platform release. Windows x64 is built with UCRT64 + static Qt 5 and is only published after static-runtime import auditing plus a real no-argument GUI launch test. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
+          gh release edit $tag --repo $repo --notes 'FRLG RevA multi-platform release. Windows x64 is built with UCRT64 + static Qt 5, with SQLite3 game-library support restored and all direct runtimes linked statically. The Windows asset is only published after PE import auditing and a real no-argument GUI launch that produces a window. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
           if ($LASTEXITCODE -ne 0) { throw 'Release metadata update failed' }
           gh release view $tag --repo $repo --json url,assets
