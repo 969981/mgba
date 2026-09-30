@@ -76,7 +76,7 @@ jobs:
             -DBUILD_SHARED=OFF \
             -DBUILD_QT=OFF \
             -DBUILD_SDL=ON \
-            -DBUILD_GL=OFF \
+            -DBUILD_GL=ON \
             -DBUILD_GLES2=OFF \
             -DBUILD_GLES3=OFF \
             -DUSE_FFMPEG=OFF \
