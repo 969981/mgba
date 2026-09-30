@@ -1,0 +1,127 @@
+name: Build FRLG RevA Win32 with source libepoxy
+
+on:
+  push:
+    branches:
+      - revA-bootstrap
+    paths:
+      - .github/workflows/reva-win32-source-epoxy.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  REV_SHA: fadbf93a565a5bd0b3e7f12b848fc208064a94f1
+  RELEASE_TAG: revA-20260930
+
+jobs:
+  win32:
+    name: Windows x86 SDL source-epoxy build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revA
+          fetch-depth: 0
+      - name: Verify source
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD).Trim() -ne '${{ env.REV_SHA }}') { throw 'revA moved' }
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW32
+          update: true
+          suppress-deprecation-warnings: msystem-mingw32
+          install: >-
+            base-devel
+            git
+            meson
+            ninja
+            p7zip
+            mingw-w64-i686-cmake
+            mingw-w64-i686-gcc
+            mingw-w64-i686-pkgconf
+            mingw-w64-i686-SDL2
+            mingw-w64-i686-zlib
+            mingw-w64-i686-ntldd-git
+      - name: Build minimal libepoxy for MINGW32
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch 1.5.10 https://github.com/anholt/libepoxy.git epoxy-src
+          meson setup epoxy-src/_build epoxy-src \
+            --prefix=/mingw32 \
+            --buildtype=release \
+            -Ddocs=false \
+            -Dtests=false \
+            -Dx11=false \
+            -Dglx=no \
+            -Degl=no
+          meson compile -C epoxy-src/_build
+          meson install -C epoxy-src/_build
+          pkg-config --modversion epoxy
+          test -f /mingw32/bin/libepoxy-0.dll
+      - name: Build compact SDL frontend
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          cmake -S . -B build -G "MSYS Makefiles" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDISTBUILD=ON \
+            -DBUILD_STATIC=ON \
+            -DBUILD_SHARED=OFF \
+            -DBUILD_QT=OFF \
+            -DBUILD_SDL=ON \
+            -DBUILD_GL=OFF \
+            -DBUILD_GLES2=OFF \
+            -DBUILD_GLES3=OFF \
+            -DUSE_FFMPEG=OFF \
+            -DUSE_MINIZIP=OFF \
+            -DUSE_LIBZIP=OFF \
+            -DUSE_PNG=OFF \
+            -DUSE_EPOXY=ON \
+            -DUSE_ELF=OFF \
+            -DUSE_LUA=OFF \
+            -DUSE_SQLITE3=OFF \
+            -DUSE_JSON_C=OFF \
+            -DUSE_FREETYPE=OFF \
+            -DUSE_LZMA=OFF \
+            -DUSE_DISCORD_RPC=OFF
+          cmake --build build --parallel 2
+          test -f build/mgba-sdl.exe
+
+          rm -rf portable
+          mkdir portable
+          cp build/mgba-sdl.exe LICENSE README.md portable/
+
+          dlls=$(ntldd -R "$PWD/portable/mgba-sdl.exe" | grep -i mingw | cut -d'>' -f2 | sed -e 's/(0x[0-9a-f]\+)//' -e 's/^ \+//' -e 's/ \+$//' -e 's,\\,/,g' || true)
+          if [ -n "$dlls" ]; then cp -vu $dlls portable/; fi
+          find portable -maxdepth 1 -type f \( -iname '*.exe' -o -iname '*.dll' \) -print0 | xargs -0 -r -n1 sh -c 'strip --strip-unneeded "$1" 2>/dev/null || true' _
+
+          test -f portable/SDL2.dll
+          test -f portable/libepoxy-0.dll
+          7z a -t7z -mx=9 -ms=on mGBA-FRLG-RevA-win32-sdl.7z ./portable/*
+          ls -lh mGBA-FRLG-RevA-win32-sdl.7z
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $old = $env:PATH
+          try {
+            $env:PATH = "$PWD\portable;C:\Windows\System32;C:\Windows"
+            $p = Start-Process -FilePath (Join-Path $PWD 'portable\mgba-sdl.exe') -ArgumentList '--version' -WorkingDirectory (Join-Path $PWD 'portable') -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "mgba-sdl.exe failed: $($p.ExitCode)" }
+          } finally { $env:PATH = $old }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win32-release
+          path: mGBA-FRLG-RevA-win32-sdl.7z
+          if-no-files-found: error
+      - name: Publish Win32 asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$env:RELEASE_TAG" --repo "$env:GITHUB_REPOSITORY" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Release not found' }
+          gh release upload "$env:RELEASE_TAG" '.\mGBA-FRLG-RevA-win32-sdl.7z' --repo "$env:GITHUB_REPOSITORY" --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Release upload failed' }
