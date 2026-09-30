@@ -1,4 +1,4 @@
-# RevA Windows release pipeline v6: official mGBA windows:w64 Docker toolchain
+# RevA Windows release pipeline v7: official mGBA windows:w64 Docker toolchain
 name: Build and publish FRLG RevA official Windows x64
 
 on:
@@ -69,7 +69,9 @@ jobs:
             -v "$PWD:/home/mgba/src" \
             "$OFFICIAL_IMAGE"
 
-          sudo chown -R "$(id -u):$(id -g)" "$BUILD_DIR"
+          # Keep the build tree owned by the same container user until CPack
+          # has finished. The official Buildbot also runs build -> cpack before
+          # its permission-cleanup step.
           test -f "$BUILD_DIR/mGBA.exe"
           test -f "$BUILD_DIR/mgba-sdl.exe"
           ls -lh "$BUILD_DIR/mGBA.exe" "$BUILD_DIR/mgba-sdl.exe"
@@ -78,11 +80,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          # Run CPack as the same `mgba` container user that created the build
+          # tree. If preinstall fails, print its real log before the container
+          # exits so the next failure is directly actionable.
           docker run --rm \
             -w "/home/mgba/src/$BUILD_DIR" \
             -v "$PWD:/home/mgba/src" \
             "$OFFICIAL_IMAGE" \
-            cpack -V -G TXZ
+            bash -lc 'cpack -V -G TXZ || { echo "==== CPack PreinstallOutput.log ===="; find _CPack_Packages -name PreinstallOutput.log -print -exec cat {} \; 2>/dev/null || true; exit 1; }'
+
+          # Match the official Buildbot ordering: permissions are relaxed only
+          # after CPack has completed, never between build and preinstall.
+          docker run --rm \
+            -w "/home/mgba/src/$BUILD_DIR" \
+            -v "$PWD:/home/mgba/src" \
+            "$OFFICIAL_IMAGE" \
+            bash -lc 'chmod -fR go+w *'
 
           sudo chown -R "$(id -u):$(id -g)" "$BUILD_DIR"
           for archive in build-base.tar.xz build-sdl.tar.xz build-qt.tar.xz; do
