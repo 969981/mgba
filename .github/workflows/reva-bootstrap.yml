@@ -48,6 +48,7 @@ jobs:
           git remote add aryan https://github.com/Aryan10/mgba-frlg-revA.git
           git fetch aryan master
           git fetch origin master revA
+          git reset --hard HEAD
           git switch -C revA origin/master
           git cherry-pick 0102d3e9db8971ee443857044a1c3b607b0df6e4
           git cherry-pick 9fd56025c6fc95c6edf6b97e3ad06805655d7849
@@ -90,10 +91,11 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $tag = 'revA-20260930'
+          gh release view $tag 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            gh release delete $tag --yes --cleanup-tag
+          }
           git tag -f $tag $env:REVA_HEAD
           git push origin "refs/tags/$tag" --force
           $assets = Get-ChildItem build -Filter *.zip | ForEach-Object { $_.FullName }
-          gh release delete $tag --yes --cleanup-tag 2>$null
-          git tag -f $tag $env:REVA_HEAD
-          git push origin "refs/tags/$tag" --force
           gh release create $tag @assets --title 'mGBA FRLG RevA (2026-09-30)' --notes "Built from 969981/mgba master c3c8e5e with Aryan10/mgba-frlg-revA commits 0102d3e and 9fd5602 rebased on top. Includes the SWI 0x48 FRLG RevA save fix."
