@@ -1,0 +1,51 @@
+name: Control test official mGBA Windows x64
+
+on:
+  push:
+    branches:
+      - revA-bootstrap
+    paths:
+      - .github/workflows/reva-win64-official-control.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  official-control:
+    runs-on: windows-2022
+    steps:
+      - name: Download official mGBA 0.10.5 win64
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path official -Force | Out-Null
+          gh release download 0.10.5 --repo mgba-emu/mgba --pattern 'mGBA-0.10.5-win64.7z' --dir official --clobber
+          & 7z x 'official\mGBA-0.10.5-win64.7z' '-oofficial\unpacked' -y
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to extract official package' }
+          Get-ChildItem official\unpacked -Recurse | Select-Object FullName,Length | Format-Table -AutoSize
+
+      - name: Real-launch official GUI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Get-ChildItem 'official\unpacked' -Recurse -Filter 'mGBA.exe' | Select-Object -First 1
+          if (-not $exe) { throw 'Official mGBA.exe not found' }
+          $root = $exe.Directory.FullName
+          $oldPath = $env:PATH
+          $p = $null
+          try {
+            $env:PATH = "$root;$env:WINDIR\System32;$env:WINDIR"
+            $p = Start-Process -FilePath $exe.FullName -WorkingDirectory $root -PassThru
+            Start-Sleep -Seconds 10
+            $p.Refresh()
+            if ($p.HasExited) {
+              throw "Official mGBA exited early with code $($p.ExitCode)"
+            }
+            Write-Host "CONTROL PASS: official mGBA alive after 10s; PID=$($p.Id); MainWindowHandle=$($p.MainWindowHandle)"
+          } finally {
+            if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+            $env:PATH = $oldPath
+          }
