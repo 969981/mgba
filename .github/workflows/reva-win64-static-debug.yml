@@ -1,0 +1,187 @@
+name: Diagnose RevA static Windows GUI crash
+
+on:
+  push:
+    branches:
+      - revA-bootstrap
+    paths:
+      - .github/workflows/reva-win64-static-debug.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [full, no-qtmm, no-sdl]
+
+    steps:
+      - name: Checkout exact RevA source
+        uses: actions/checkout@v4
+        with:
+          ref: fadbf93a565a5bd0b3e7f12b848fc208064a94f1
+          fetch-depth: 0
+
+      - name: Set up static MinGW64 diagnostic toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          suppress-deprecation-warnings: msystem-mingw64
+          install: >-
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-qt5-static
+            mingw-w64-x86_64-SDL2
+            mingw-w64-x86_64-libepoxy
+            mingw-w64-x86_64-libpng
+            mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-zstd
+            mingw-w64-x86_64-openssl
+
+      - name: Configure symbolized static build
+        shell: msys2 {0}
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+          export PATH="/mingw64/qt5-static/bin:/mingw64/bin:$PATH"
+
+          QTMM=FALSE
+          SDL=ON
+          if [[ "$VARIANT" == "no-qtmm" ]]; then
+            QTMM=TRUE
+          fi
+          if [[ "$VARIANT" == "no-sdl" ]]; then
+            SDL=OFF
+          fi
+
+          if [[ "$VARIANT" == "no-qtmm" ]]; then
+            # Static main.cpp always imports QJpegPlugin. Upstream currently
+            # links that plugin only from the QtMultimedia block, so keep JPEG
+            # explicitly while disabling only Multimedia for this control.
+            python - <<'PY'
+          from pathlib import Path
+          p = Path('src/platform/qt/CMakeLists.txt')
+          s = p.read_text(encoding='utf-8')
+          needle = '''if(QT_TYPE STREQUAL STATIC_LIBRARY)\n\tset(QT_STATIC ON)\n\tlist(APPEND QT_DEFINES QT_STATIC)\nendif()\n'''
+          repl = needle + '''\nif(WIN32 AND QT_STATIC AND TARGET ${QT}::QJpegPlugin)\n\tlist(APPEND QT_LIBRARIES ${QT}::QJpegPlugin)\nendif()\n'''
+          if needle not in s:
+              raise SystemExit('static Qt block not found')
+          p.write_text(s.replace(needle, repl, 1), encoding='utf-8')
+          PY
+          fi
+
+          mkdir -p /mingw64/lib/.reva-hidden-import-libs
+          for name in png16 ssl crypto zstd z SDL2 epoxy; do
+            imp="/mingw64/lib/lib${name}.dll.a"
+            [[ -f "$imp" ]] && mv "$imp" /mingw64/lib/.reva-hidden-import-libs/
+          done
+
+          cmake -S . -B build-debug -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_FLAGS_RELWITHDEBINFO='-O1 -g3 -DNDEBUG' \
+            -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='-O1 -g3 -DNDEBUG' \
+            -DCMAKE_PREFIX_PATH=/mingw64/qt5-static \
+            -DQt5_DIR=/mingw64/qt5-static/lib/cmake/Qt5 \
+            -DFORCE_QT_VERSION=5 \
+            -DCMAKE_DISABLE_FIND_PACKAGE_Qt5Multimedia=$QTMM \
+            -DCMAKE_EXE_LINKER_FLAGS='-static -static-libgcc -static-libstdc++' \
+            -DCMAKE_STRIP=/usr/bin/true \
+            -DDISTBUILD=OFF \
+            -DBUILD_STATIC=ON \
+            -DBUILD_SHARED=OFF \
+            -DBUILD_LTO=OFF \
+            -DBUILD_QT=ON \
+            -DBUILD_SDL=$SDL \
+            -DBUILD_GL=ON \
+            -DBUILD_GLES2=OFF \
+            -DBUILD_GLES3=OFF \
+            -DUSE_EPOXY=ON \
+            -DEPOXY_LIBRARIES=/mingw64/lib/libepoxy.a \
+            -DEPOXY_INCLUDE_DIRS=/mingw64/include \
+            -DUSE_ZLIB=ON \
+            -DZLIB_LIBRARY=/mingw64/lib/libz.a \
+            -DZLIB_LIBRARY_RELEASE=/mingw64/lib/libz.a \
+            -DZLIB_INCLUDE_DIR=/mingw64/include \
+            -DUSE_PNG=ON \
+            -DPNG_LIBRARY=/mingw64/qt5-static/lib/libqtlibpng.a \
+            -DPNG_LIBRARY_RELEASE=/mingw64/qt5-static/lib/libqtlibpng.a \
+            -DPNG_PNG_INCLUDE_DIR=/mingw64/include \
+            -DSDL2_LIBRARIES_TEMP=/mingw64/lib/libSDL2.a \
+            -DSDL2MAIN_LIBRARY=/mingw64/lib/libSDL2main.a \
+            -DUSE_MINIZIP=OFF \
+            -DUSE_FFMPEG=OFF \
+            -DUSE_LIBZIP=OFF \
+            -DUSE_LZMA=OFF \
+            -DUSE_ELF=OFF \
+            -DUSE_LUA=OFF \
+            -DUSE_SQLITE3=OFF \
+            -DUSE_JSON_C=OFF \
+            -DUSE_DISCORD_RPC=OFF
+
+      - name: Build diagnostic GUI
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          export PATH="/mingw64/qt5-static/bin:/mingw64/bin:$PATH"
+          cmake --build build-debug --target mgba-qt --parallel 2
+          test -f build-debug/mGBA.exe
+          ls -lh build-debug/mGBA.exe
+          file build-debug/mGBA.exe
+          echo '==== imports ===='
+          objdump -p build-debug/mGBA.exe | awk '/DLL Name:/ {print $3}'
+
+      - name: Real-launch no-LTO diagnostic
+        id: launch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = (Resolve-Path 'build-debug\mGBA.exe').Path
+          $root = Split-Path $exe -Parent
+          $oldPath = $env:PATH
+          $p = $null
+          try {
+            $env:PATH = "$root;$env:WINDIR\System32;$env:WINDIR"
+            $p = Start-Process -FilePath $exe -WorkingDirectory $root -PassThru
+            Start-Sleep -Seconds 8
+            $p.Refresh()
+            if ($p.HasExited) {
+              Write-Host "DIAGNOSTIC_CRASH exit=$($p.ExitCode)"
+              "crashed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+              "exitcode=$($p.ExitCode)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            } else {
+              Write-Host "DIAGNOSTIC_PASS alive PID=$($p.Id) MainWindowHandle=$($p.MainWindowHandle)"
+              "crashed=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+              "exitcode=alive" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            }
+          } finally {
+            if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+            $env:PATH = $oldPath
+          }
+
+      - name: Capture GDB backtrace when crash reproduces
+        if: steps.launch.outputs.crashed == 'true'
+        shell: msys2 {0}
+        run: |
+          set +e
+          export PATH="/mingw64/qt5-static/bin:/mingw64/bin:$PATH"
+          echo '==== GDB crash trace ===='
+          timeout 45s gdb -q -batch \
+            -ex 'set pagination off' \
+            -ex 'set confirm off' \
+            -ex 'set print thread-events off' \
+            -ex 'run' \
+            -ex 'info registers' \
+            -ex 'thread apply all bt full' \
+            --args build-debug/mGBA.exe 2>&1 | tee "gdb-${VARIANT}.txt"
+          rc=${PIPESTATUS[0]}
+          echo "gdb/timeout rc=$rc"
+          exit 0
+        env:
+          VARIANT: ${{ matrix.variant }}
