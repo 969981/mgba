@@ -1,4 +1,4 @@
-name: Build and release FRLG RevA portable Windows x64
+name: Build and release FRLG RevA compact Windows x64
 
 on:
   push:
@@ -102,12 +102,9 @@ jobs:
           test -f portable/mgba-sdl.exe
           test ! -f portable/libmgba.dll
 
-          # Match upstream mGBA packaging: ntldd -R only the shipped executables,
-          # then let windeployqt add the minimal Qt runtime/plugins.
           ./tools/deploy-win.sh "$PWD/portable/mGBA.exe" "$PWD/portable" "$PWD"
           ./tools/deploy-win.sh "$PWD/portable/mgba-sdl.exe" "$PWD/portable" "$PWD"
 
-          # Strip symbols where possible; ignore files that are not PE binaries.
           find portable -maxdepth 1 -type f \( -iname '*.exe' -o -iname '*.dll' \) -print0 | \
             xargs -0 -r -n1 sh -c 'strip --strip-unneeded "$1" 2>/dev/null || true' _
 
@@ -182,18 +179,9 @@ jobs:
           $repo = '969981/mgba'
           $tag = 'revA-20260930'
           $expected = 'fadbf93a565a5bd0b3e7f12b848fc208064a94f1'
-          $assets = @(
-            '.\mGBA-FRLG-RevA-Windows-x64.zip',
-            '.\mGBA-FRLG-RevA-win64.7z'
-          )
+          $assets = @('.\mGBA-FRLG-RevA-Windows-x64.zip','.\mGBA-FRLG-RevA-win64.7z')
           $title = 'mGBA FRLG RevA (2026-09-30)'
-          $notes = @'
-FRLG RevA build based on 969981/mgba master c3c8e5e with the RevA commits rebased on top as c809ee643 and fadbf93a5.
-
-Windows x64 packaging now follows upstream mGBA's deploy strategy: only runtime DLLs reachable from the shipped executables are collected with ntldd -R, then windeployqt adds the required Qt runtime/plugins. The core is linked statically and symbols are stripped. Both ZIP and official-style solid 7z packages are provided.
-
-Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.
-'@
+          $notes = 'FRLG RevA build based on 969981/mgba master c3c8e5e with the RevA commits rebased on top as c809ee643 and fadbf93a5. Windows x64 packaging follows upstream mGBA deploy logic: runtime DLLs are collected with ntldd -R and Qt runtime/plugins with windeployqt. The core is linked statically, symbols are stripped, and both ZIP and solid 7z packages are provided. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
 
           $tagSha = gh api "repos/$repo/git/ref/tags/$tag" --jq '.object.sha' 2>$null
           if ($LASTEXITCODE -eq 0) {
@@ -213,7 +201,7 @@ Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.
             gh release edit $tag --repo $repo --title $title --notes $notes
             if ($LASTEXITCODE -ne 0) { throw 'Failed to update release metadata' }
           } else {
-            gh release create $tag @assets --repo $repo --verify-tag --title $title --notes $notes
+            gh release create $tag $assets --repo $repo --verify-tag --title $title --notes $notes
             if ($LASTEXITCODE -ne 0) { throw 'Failed to create release' }
           }
 
