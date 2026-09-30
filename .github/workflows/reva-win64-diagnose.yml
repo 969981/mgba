@@ -1,0 +1,127 @@
+name: Diagnose released FRLG RevA Windows x64
+
+on:
+  push:
+    branches:
+      - revA-bootstrap
+    paths:
+      - .github/workflows/reva-win64-diagnose.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose-release:
+    runs-on: windows-2022
+    steps:
+      - name: Set up MSVC inspection tools
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Download current released win64 package
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path download,unpacked,diagnostics -Force | Out-Null
+          gh release download revA-20260930 --repo 969981/mgba --pattern 'mGBA-FRLG-RevA-win64.7z' --dir download --clobber
+          $asset = Get-Item 'download\mGBA-FRLG-RevA-win64.7z'
+          Write-Host "Downloaded $($asset.Length) bytes"
+          & 7z x $asset.FullName '-ounpacked' -y
+          if ($LASTEXITCODE -ne 0) { throw '7z extract failed' }
+          Get-ChildItem unpacked -Recurse | Select-Object FullName,Length | Format-Table -AutoSize
+
+      - name: Audit package imports and missing files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Get-ChildItem unpacked -Recurse -Filter 'mGBA.exe' | Select-Object -First 1
+          if (-not $exe) { throw 'mGBA.exe not found in released package' }
+          $root = $exe.Directory.FullName
+          Set-Content diagnostics\portable-root.txt $root
+
+          $packageNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+          Get-ChildItem $root -Recurse -File | ForEach-Object { [void]$packageNames.Add($_.Name) }
+
+          $systemDirs = @("$env:WINDIR\System32", "$env:WINDIR\SysWOW64")
+          $missing = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+          $report = New-Object System.Collections.Generic.List[string]
+
+          function Get-Imports([string]$path) {
+            $out = & dumpbin.exe /dependents $path 2>$null
+            foreach ($line in $out) {
+              if ($line -match '^\s+([^\s]+\.dll)\s*$') { $matches[1] }
+            }
+          }
+
+          Get-ChildItem $root -Recurse -File | Where-Object { $_.Extension -in '.exe','.dll' } | ForEach-Object {
+            $report.Add("=== $($_.FullName.Substring($root.Length).TrimStart('\')) ===")
+            foreach ($dep in (Get-Imports $_.FullName)) {
+              $where = if ($packageNames.Contains($dep)) { 'PACKAGE' } elseif ($systemDirs | Where-Object { Test-Path (Join-Path $_ $dep) }) { 'WINDOWS' } else { 'MISSING' }
+              $report.Add("$where`t$dep")
+              if ($where -eq 'MISSING') { [void]$missing.Add($dep) }
+            }
+          }
+          $report | Set-Content diagnostics\imports.txt
+          $report | ForEach-Object { Write-Host $_ }
+
+          if ($missing.Count -gt 0) {
+            Write-Host 'Potential missing imports:'
+            $missing | Sort-Object | Tee-Object -FilePath diagnostics\missing-imports.txt
+          } else {
+            Set-Content diagnostics\missing-imports.txt 'No direct PE imports missing on this runner.'
+          }
+
+          foreach ($must in @('platforms\qwindows.dll','audio')) {
+            $p = Join-Path $root $must
+            if (-not (Test-Path $p)) { Write-Warning "Expected Qt runtime payload missing: $must" }
+          }
+
+      - name: Real-launch released GUI in isolated PATH
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Get-Content diagnostics\portable-root.txt -Raw
+          $root = $root.Trim()
+          $exe = Join-Path $root 'mGBA.exe'
+          $stdout = (Resolve-Path diagnostics).Path + '\gui.stdout.txt'
+          $stderr = (Resolve-Path diagnostics).Path + '\gui.stderr.txt'
+          $oldPath = $env:PATH
+          $p = $null
+          $start = Get-Date
+          try {
+            $env:PATH = "$root;$env:WINDIR\System32;$env:WINDIR"
+            $env:QT_DEBUG_PLUGINS = '1'
+            $p = Start-Process -FilePath $exe -WorkingDirectory $root -PassThru `
+              -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+            Start-Sleep -Seconds 10
+            $p.Refresh()
+            if ($p.HasExited) {
+              Set-Content diagnostics\launch-result.txt "FAILED: exited early, code=$($p.ExitCode)"
+              Write-Host "Released mGBA exited early, code=$($p.ExitCode)"
+              if (Test-Path $stdout) { Get-Content $stdout -ErrorAction SilentlyContinue }
+              if (Test-Path $stderr) { Get-Content $stderr -ErrorAction SilentlyContinue }
+              Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=$start} -ErrorAction SilentlyContinue |
+                Select-Object TimeCreated,ProviderName,Id,LevelDisplayName,Message |
+                Format-List | Out-String | Tee-Object -FilePath diagnostics\application-events.txt
+              throw 'Released package failed real GUI launch test'
+            }
+            $result = "PASS: alive after 10s; PID=$($p.Id); MainWindowHandle=$($p.MainWindowHandle)"
+            Set-Content diagnostics\launch-result.txt $result
+            Write-Host $result
+          } finally {
+            if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+            $env:PATH = $oldPath
+            Remove-Item Env:QT_DEBUG_PLUGINS -ErrorAction SilentlyContinue
+          }
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: released-win64-diagnostics
+          path: diagnostics
+          if-no-files-found: warn
