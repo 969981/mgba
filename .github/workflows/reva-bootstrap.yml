@@ -116,9 +116,6 @@ jobs:
           "$WINDEPLOYQT" --no-opengl-sw --no-svg --release \
             --dir "$PWD/portable" "$PWD/portable/mGBA.exe"
 
-          # Build a case-insensitive DLL index once, then traverse each PE file
-          # exactly once. New MinGW DLLs are appended to the queue so their own
-          # imports are resolved recursively without repeated full-directory scans.
           declare -A mingw_dll
           while IFS= read -r p; do
             name=$(basename "$p")
@@ -185,13 +182,23 @@ jobs:
           }
           if (Test-Path (Join-Path $portable 'libmgba.dll')) { throw 'libmgba.dll unexpectedly present; core is not static' }
 
+          function Test-PortableExe([string]$exeName) {
+            $exe = Join-Path $portable $exeName
+            Write-Host "Testing $exeName with isolated PATH..."
+            try {
+              $p = Start-Process -FilePath $exe -ArgumentList '--version' -WorkingDirectory $portable -Wait -PassThru
+            } catch {
+              throw "$exeName failed to start: $($_.Exception.Message)"
+            }
+            Write-Host "$exeName exit code: $($p.ExitCode)"
+            if ($p.ExitCode -ne 0) { throw "$exeName --version failed with $($p.ExitCode)" }
+          }
+
           $oldPath = $env:PATH
           try {
             $env:PATH = "$portable;C:\Windows\System32;C:\Windows"
-            & "$portable\mGBA.exe" --version
-            if ($LASTEXITCODE -ne 0) { throw "mGBA.exe --version failed with $LASTEXITCODE" }
-            & "$portable\mgba-sdl.exe" --version
-            if ($LASTEXITCODE -ne 0) { throw "mgba-sdl.exe --version failed with $LASTEXITCODE" }
+            Test-PortableExe 'mgba-sdl.exe'
+            Test-PortableExe 'mGBA.exe'
           } finally {
             $env:PATH = $oldPath
           }
