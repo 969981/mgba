@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - revA-bootstrap
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -89,7 +90,7 @@ jobs:
         shell: msys2 {0}
         run: |
           set -euxo pipefail
-          rm -rf cpack-extracted portable runtime-dlls.txt
+          rm -rf cpack-extracted portable
           mkdir -p cpack-extracted portable
 
           BASE_ZIP=$(find build-static -maxdepth 1 -type f -iname '*.zip' | head -n 1)
@@ -110,31 +111,49 @@ jobs:
           test -f portable/mgba-sdl.exe
           test ! -f portable/libmgba.dll
 
-          WINDEPLOYQT=/mingw64/bin/windeployqt-qt5.exe
-          test -x "$WINDEPLOYQT"
+          WINDEPLOYQT=$(command -v windeployqt-qt5 || command -v windeployqt || true)
+          test -n "$WINDEPLOYQT"
           "$WINDEPLOYQT" --no-opengl-sw --no-svg --release \
             --dir "$PWD/portable" "$PWD/portable/mGBA.exe"
 
-          find portable -type f \( -iname '*.exe' -o -iname '*.dll' \) -print0 |
-            while IFS= read -r -d '' bin; do ntldd -R "$bin" || true; done |
-            grep -i mingw |
-            cut -d'>' -f2 |
-            sed -e 's/(0x[0-9a-fA-F]\+)//' -e 's/^ \+//' -e 's/ \+$//' -e 's,\\,/,g' |
-            sort -u > runtime-dlls.txt
+          # windeployqt handles Qt itself and its plugins. Collect every other
+          # MinGW runtime dependency recursively from each PE import table.
+          changed=1
+          while [ "$changed" -eq 1 ]; do
+            changed=0
+            while IFS= read -r bin; do
+              while IFS= read -r dep; do
+                dep=$(printf '%s' "$dep" | tr -d '\r')
+                [ -n "$dep" ] || continue
 
-          while IFS= read -r dll; do
-            if [ -f "$dll" ]; then
-              cp -f "$dll" portable/
-            fi
-          done < runtime-dlls.txt
+                existing=$(find portable -type f -iname "$dep" -print -quit)
+                if [ -n "$existing" ]; then
+                  continue
+                fi
+
+                src=$(find /mingw64/bin -maxdepth 1 -type f -iname "$dep" -print -quit)
+                if [ -n "$src" ]; then
+                  echo "Bundling $dep from $src"
+                  cp -f "$src" portable/
+                  changed=1
+                fi
+              done < <(objdump -p "$bin" 2>/dev/null | awk '/DLL Name:/ {print $3}')
+            done < <(find portable -type f \( -iname '*.exe' -o -iname '*.dll' \) -print)
+          done
 
           test -f portable/Qt5Core.dll
           test -f portable/libstdc++-6.dll
           test -f portable/SDL2.dll
           test -f portable/platforms/qwindows.dll
 
-          MISSING=$({ ntldd -R portable/mGBA.exe; ntldd -R portable/mgba-sdl.exe; } | grep -i 'not found' || true)
+          MISSING=$(
+            {
+              ntldd -R portable/mGBA.exe || true
+              ntldd -R portable/mgba-sdl.exe || true
+            } | grep -i 'not found' || true
+          )
           if [ -n "$MISSING" ]; then
+            echo "Unresolved runtime dependencies:"
             echo "$MISSING"
             exit 1
           fi
@@ -182,19 +201,33 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $repo = '969981/mgba'
           $tag = 'revA-20260930'
           $expected = 'fadbf93a565a5bd0b3e7f12b848fc208064a94f1'
-          $actual = (gh api "repos/969981/mgba/git/ref/tags/$tag" --jq '.object.sha').Trim()
-          if ($actual -ne $expected) { throw "Tag $tag points to $actual, expected $expected" }
+          $asset = '.\mGBA-FRLG-RevA-Windows-x64.zip'
+          $title = 'mGBA FRLG RevA (2026-09-30)'
+          $notes = 'Windows x64 portable build based on 969981/mgba master c3c8e5e, with Aryan10/mgba-frlg-revA commits 0102d3e and 9fd5602 rebased on top as c809ee643 and fadbf93a5. The mGBA core is linked statically for Windows distribution stability; Qt/SDL runtime dependencies are bundled. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
 
-          gh release view $tag --repo 969981/mgba 2>$null | Out-Null
+          $tagSha = gh api "repos/$repo/git/ref/tags/$tag" --jq '.object.sha' 2>$null
           if ($LASTEXITCODE -eq 0) {
-            gh release delete $tag --repo 969981/mgba --yes
+            $tagSha = $tagSha.Trim()
+            if ($tagSha -ne $expected) {
+              throw "Tag $tag points to $tagSha, expected $expected"
+            }
+          } else {
+            gh api --method POST "repos/$repo/git/refs" -f "ref=refs/tags/$tag" -f "sha=$expected" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Failed to create tag $tag at $expected" }
           }
 
-          gh release create $tag '.\mGBA-FRLG-RevA-Windows-x64.zip' \
-            --repo 969981/mgba \
-            --verify-tag \
-            --title 'mGBA FRLG RevA (2026-09-30)' \
-            --notes 'Windows x64 portable build based on 969981/mgba master c3c8e5e, with Aryan10/mgba-frlg-revA commits 0102d3e and 9fd5602 rebased on top as c809ee643 and fadbf93a5. The mGBA core is linked statically for Windows distribution stability; Qt/SDL runtime dependencies are bundled. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
-          gh release view $tag --repo 969981/mgba --json url,tagName,targetCommitish,assets
+          gh release view $tag --repo $repo 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $asset --repo $repo --clobber
+            if ($LASTEXITCODE -ne 0) { throw "Failed to upload release asset" }
+            gh release edit $tag --repo $repo --title $title --notes $notes
+            if ($LASTEXITCODE -ne 0) { throw "Failed to update release metadata" }
+          } else {
+            gh release create $tag $asset --repo $repo --verify-tag --title $title --notes $notes
+            if ($LASTEXITCODE -ne 0) { throw "Failed to create release" }
+          }
+
+          gh release view $tag --repo $repo --json url,tagName,targetCommitish,assets
