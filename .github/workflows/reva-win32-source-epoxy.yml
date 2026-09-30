@@ -36,9 +36,10 @@ jobs:
           install: >-
             base-devel
             git
-            meson
-            ninja
             p7zip
+            mingw-w64-i686-python
+            mingw-w64-i686-meson
+            mingw-w64-i686-ninja
             mingw-w64-i686-cmake
             mingw-w64-i686-gcc
             mingw-w64-i686-pkgconf
@@ -49,6 +50,8 @@ jobs:
         shell: msys2 {0}
         run: |
           set -euxo pipefail
+          python --version
+          meson --version
           git clone --depth 1 --branch 1.5.10 https://github.com/anholt/libepoxy.git epoxy-src
           meson setup epoxy-src/_build epoxy-src \
             --prefix=/mingw32 \
@@ -118,6 +121,7 @@ jobs:
           path: mGBA-FRLG-RevA-win32-sdl.7z
           if-no-files-found: error
       - name: Publish Win32 asset
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
