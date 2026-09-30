@@ -1,4 +1,4 @@
-name: Finalize FRLG RevA portable release
+name: Build and release FRLG RevA portable Windows x64
 
 on:
   push:
@@ -6,69 +6,114 @@ on:
       - revA-bootstrap
 
 permissions:
-  actions: read
   contents: write
 
 jobs:
-  finalize-release:
+  build-release:
     runs-on: windows-latest
     steps:
-      - name: Checkout bootstrap branch
+      - name: Checkout exact RevA source
         uses: actions/checkout@v4
         with:
+          ref: revA
           fetch-depth: 0
 
-      - name: Download successful RevA build artifact
+      - name: Verify RevA source commit
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force downloaded | Out-Null
-          gh run download 36659361402 --repo 969981/mgba --name mGBA-FRLG-RevA-Windows-x64 --dir downloaded
-          Get-ChildItem downloaded
+          $expected = 'fadbf93a565a5bd0b3e7f12b848fc208064a94f1'
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $expected) { throw "revA moved: $actual, expected $expected" }
+          git log --oneline --decorate -3
 
-      - name: Set up MSYS2 runtime packaging tools
+      - name: Set up MSYS2 MinGW64
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
           update: true
           install: >-
+            base-devel
+            git
             unzip
+            mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ffmpeg
             mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-gdb
             mingw-w64-x86_64-libelf
             mingw-w64-x86_64-libepoxy
             mingw-w64-x86_64-libzip
             mingw-w64-x86_64-lua
+            mingw-w64-x86_64-pkgconf
             mingw-w64-x86_64-angleproject
-            mingw-w64-x86_64-qt5-base
-            mingw-w64-x86_64-qt5-multimedia
-            mingw-w64-x86_64-qt5-tools
+            mingw-w64-x86_64-qt5
             mingw-w64-x86_64-SDL2
             mingw-w64-x86_64-ntldd-git
+
+      - name: Configure static-core release build
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          cmake -S . -B build-static -G "MSYS Makefiles" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_STATIC=ON \
+            -DBUILD_SHARED=OFF
+
+      - name: Build mGBA
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          cmake --build build-static --parallel 2
+          find build-static -type f \( -iname 'mGBA.exe' -o -iname 'mgba-sdl.exe' \) -print
+
+      - name: Smoke-test static-core build in MSYS2
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          QT_EXE=$(find build-static -type f -iname 'mGBA.exe' | head -n 1)
+          SDL_EXE=$(find build-static -type f -iname 'mgba-sdl.exe' | head -n 1)
+          test -n "$QT_EXE"
+          test -n "$SDL_EXE"
+          "$QT_EXE" --version
+          "$SDL_EXE" --version
+
+      - name: Create base CPack ZIP
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          cd build-static
+          cpack -G ZIP
+          ls -lah *.zip
 
       - name: Assemble portable Windows x64 directory
         shell: msys2 {0}
         run: |
           set -euxo pipefail
-          rm -rf cpack-extracted portable
+          rm -rf cpack-extracted portable runtime-dlls.txt
           mkdir -p cpack-extracted portable
-          INNER_ZIP=$(find downloaded -maxdepth 2 -type f -iname '*.zip' | head -n 1)
-          test -n "$INNER_ZIP"
-          unzip -q "$INNER_ZIP" -d cpack-extracted
+
+          BASE_ZIP=$(find build-static -maxdepth 1 -type f -iname '*.zip' | head -n 1)
+          test -n "$BASE_ZIP"
+          unzip -q "$BASE_ZIP" -d cpack-extracted
+
+          TOP_COUNT=$(find cpack-extracted -mindepth 1 -maxdepth 1 | wc -l)
           ROOT=$(find cpack-extracted -mindepth 1 -maxdepth 1 -type d | head -n 1)
-          test -n "$ROOT"
-          cp -a "$ROOT"/. portable/
+          if [ "$TOP_COUNT" -eq 1 ] && [ -n "$ROOT" ]; then
+            cp -a "$ROOT"/. portable/
+          else
+            cp -a cpack-extracted/. portable/
+          fi
+
           rm -rf portable/include
-          rm -f portable/libmgba.dll.a
+          rm -f portable/libmgba.a portable/libmgba.dll portable/libmgba.dll.a
           test -f portable/mGBA.exe
           test -f portable/mgba-sdl.exe
-          test -f portable/libmgba.dll
+          test ! -f portable/libmgba.dll
 
           WINDEPLOYQT=/mingw64/bin/windeployqt-qt5.exe
           test -x "$WINDEPLOYQT"
-          "$WINDEPLOYQT" --no-opengl-sw --no-svg --release --dir "$PWD/portable" "$PWD/portable/mGBA.exe"
+          "$WINDEPLOYQT" --no-opengl-sw --no-svg --release \
+            --dir "$PWD/portable" "$PWD/portable/mGBA.exe"
 
           find portable -type f \( -iname '*.exe' -o -iname '*.dll' \) -print0 |
             while IFS= read -r -d '' bin; do ntldd -R "$bin" || true; done |
@@ -87,26 +132,36 @@ jobs:
           test -f portable/libstdc++-6.dll
           test -f portable/SDL2.dll
           test -f portable/platforms/qwindows.dll
-          echo "Runtime files: $(find portable -type f | wc -l)"
-          echo "DLL files: $(find portable -type f -iname '*.dll' | wc -l)"
 
-      - name: Smoke-test portable binaries and create ZIP
+          MISSING=$({ ntldd -R portable/mGBA.exe; ntldd -R portable/mgba-sdl.exe; } | grep -i 'not found' || true)
+          if [ -n "$MISSING" ]; then
+            echo "$MISSING"
+            exit 1
+          fi
+
+          echo "Portable files: $(find portable -type f | wc -l)"
+          echo "Portable DLLs: $(find portable -type f -iname '*.dll' | wc -l)"
+
+      - name: Smoke-test portable package and create ZIP
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $portable = Join-Path $PWD 'portable'
-          if (-not (Test-Path "$portable\platforms\qwindows.dll")) { throw 'qwindows.dll missing' }
-          if (-not (Test-Path "$portable\Qt5Core.dll")) { throw 'Qt5Core.dll missing' }
-          if (-not (Test-Path "$portable\libstdc++-6.dll")) { throw 'libstdc++-6.dll missing' }
-          if (-not (Test-Path "$portable\SDL2.dll")) { throw 'SDL2.dll missing' }
+          foreach ($required in @('mGBA.exe','mgba-sdl.exe','Qt5Core.dll','libstdc++-6.dll','SDL2.dll','platforms\qwindows.dll')) {
+            if (-not (Test-Path (Join-Path $portable $required))) { throw "$required missing" }
+          }
+          if (Test-Path (Join-Path $portable 'libmgba.dll')) { throw 'libmgba.dll unexpectedly present; core is not static' }
 
           $oldPath = $env:PATH
-          $env:PATH = "$portable;C:\Windows\System32;C:\Windows"
-          & "$portable\mGBA.exe" --version
-          if ($LASTEXITCODE -ne 0) { throw "mGBA.exe --version failed with $LASTEXITCODE" }
-          & "$portable\mgba-sdl.exe" --version
-          if ($LASTEXITCODE -ne 0) { throw "mgba-sdl.exe --version failed with $LASTEXITCODE" }
-          $env:PATH = $oldPath
+          try {
+            $env:PATH = "$portable;C:\Windows\System32;C:\Windows"
+            & "$portable\mGBA.exe" --version
+            if ($LASTEXITCODE -ne 0) { throw "mGBA.exe --version failed with $LASTEXITCODE" }
+            & "$portable\mgba-sdl.exe" --version
+            if ($LASTEXITCODE -ne 0) { throw "mgba-sdl.exe --version failed with $LASTEXITCODE" }
+          } finally {
+            $env:PATH = $oldPath
+          }
 
           $zip = Join-Path $PWD 'mGBA-FRLG-RevA-Windows-x64.zip'
           if (Test-Path $zip) { Remove-Item $zip -Force }
@@ -137,5 +192,9 @@ jobs:
             gh release delete $tag --repo 969981/mgba --yes
           }
 
-          gh release create $tag '.\mGBA-FRLG-RevA-Windows-x64.zip' --repo 969981/mgba --verify-tag --title 'mGBA FRLG RevA (2026-09-30)' --notes 'Windows x64 portable build based on 969981/mgba master c3c8e5e, with Aryan10/mgba-frlg-revA commits 0102d3e and 9fd5602 rebased on top as c809ee643 and fadbf93a5. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
+          gh release create $tag '.\mGBA-FRLG-RevA-Windows-x64.zip' \
+            --repo 969981/mgba \
+            --verify-tag \
+            --title 'mGBA FRLG RevA (2026-09-30)' \
+            --notes 'Windows x64 portable build based on 969981/mgba master c3c8e5e, with Aryan10/mgba-frlg-revA commits 0102d3e and 9fd5602 rebased on top as c809ee643 and fadbf93a5. The mGBA core is linked statically for Windows distribution stability; Qt/SDL runtime dependencies are bundled. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
           gh release view $tag --repo 969981/mgba --json url,tagName,targetCommitish,assets
