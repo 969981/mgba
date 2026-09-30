@@ -1,4 +1,4 @@
-name: Build and release FRLG RevA compact Windows x64
+name: Build and release FRLG RevA official-style Windows x64
 
 on:
   push:
@@ -12,12 +12,12 @@ permissions:
   contents: write
 
 concurrency:
-  group: reva-win64-compact
+  group: reva-win64-msvc
   cancel-in-progress: true
 
 jobs:
   build-release:
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - name: Checkout exact RevA source
         uses: actions/checkout@v4
@@ -34,167 +34,168 @@ jobs:
           if ($actual -ne $expected) { throw "revA moved: $actual, expected $expected" }
           git log --oneline --decorate -3
 
-      - name: Set up MSYS2 MinGW64
-        uses: msys2/setup-msys2@v2
+      - name: Install Qt 5 MSVC
+        uses: jurplel/install-qt-action@v4
         with:
-          msystem: MINGW64
-          update: true
-          install: >-
-            base-devel
-            git
-            unzip
-            p7zip
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-libepoxy
-            mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-qt5
-            mingw-w64-x86_64-SDL2
-            mingw-w64-x86_64-ntldd-git
+          version: '5.15.2'
+          host: windows
+          target: desktop
+          arch: win64_msvc2019_64
+          cache: true
+          modules: 'qtmultimedia'
 
-      - name: Configure compact release build
-        shell: msys2 {0}
+      - name: Prepare vcpkg release dependencies
+        shell: pwsh
         run: |
-          set -euxo pipefail
-          cmake -S . -B build-release -G "MSYS Makefiles" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DDISTBUILD=ON \
-            -DBUILD_STATIC=ON \
-            -DBUILD_SHARED=OFF \
-            -DBUILD_LTO=ON \
-            -DUSE_FFMPEG=OFF \
-            -DUSE_LIBZIP=OFF \
-            -DUSE_MINIZIP=OFF \
-            -DUSE_LZMA=OFF \
-            -DUSE_ELF=OFF \
-            -DUSE_LUA=OFF \
-            -DUSE_SQLITE3=OFF \
-            -DUSE_JSON_C=OFF \
-            -DUSE_DISCORD_RPC=OFF
+          $ErrorActionPreference = 'Stop'
+          $vcpkg = Join-Path $env:VCPKG_INSTALLATION_ROOT 'vcpkg.exe'
+          if (-not (Test-Path $vcpkg)) { throw "vcpkg not found at $vcpkg" }
+          & $vcpkg install libepoxy sdl2 libpng --triplet x64-windows-release --recurse
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg dependency install failed' }
 
-      - name: Build mGBA
-        shell: msys2 {0}
+      - name: Configure MSVC distribution build
+        shell: pwsh
         run: |
-          set -euxo pipefail
-          cmake --build build-release --parallel 2
-          test -f build-release/mGBA.exe
-          test -f build-release/mgba-sdl.exe
+          $ErrorActionPreference = 'Stop'
+          $toolchain = Join-Path $env:VCPKG_INSTALLATION_ROOT 'scripts\buildsystems\vcpkg.cmake'
+          $runtimeOut = (Join-Path $PWD 'build-release\runtime').Replace('\','/')
+          cmake -S . -B build-release -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="$toolchain" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-release `
+            -DDISTBUILD=ON `
+            -DBUILD_STATIC=ON `
+            -DBUILD_SHARED=OFF `
+            -DBUILD_LTO=ON `
+            -DUSE_FFMPEG=OFF `
+            -DUSE_LIBZIP=OFF `
+            -DUSE_LZMA=OFF `
+            -DUSE_ELF=OFF `
+            -DUSE_LUA=OFF `
+            -DUSE_SQLITE3=OFF `
+            -DUSE_JSON_C=OFF `
+            -DUSE_DISCORD_RPC=OFF `
+            -DCMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE="$runtimeOut"
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
 
-      - name: Create upstream CPack components
-        shell: msys2 {0}
+      - name: Build Release
+        shell: pwsh
         run: |
-          set -euxo pipefail
-          cd build-release
-          cpack -G ZIP
-          ls -lah *-base.zip *-qt.zip *-sdl.zip
+          $ErrorActionPreference = 'Stop'
+          cmake --build build-release --config Release --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+          Get-ChildItem build-release -Recurse -Filter *.exe | Select-Object FullName,Length | Format-Table -AutoSize
 
-      - name: Assemble compact portable directory
-        shell: msys2 {0}
-        run: |
-          set -euxo pipefail
-          rm -rf portable
-          mkdir -p portable
-
-          BASE_ZIP=$(find build-release -maxdepth 1 -type f -iname '*-base.zip' | head -n1)
-          QT_ZIP=$(find build-release -maxdepth 1 -type f -iname '*-qt.zip' | head -n1)
-          SDL_ZIP=$(find build-release -maxdepth 1 -type f -iname '*-sdl.zip' | head -n1)
-          test -n "$BASE_ZIP"
-          test -n "$QT_ZIP"
-          test -n "$SDL_ZIP"
-
-          unzip -qo "$BASE_ZIP" -d portable
-          unzip -qo "$QT_ZIP" -d portable
-          unzip -qo "$SDL_ZIP" -d portable
-
-          rm -rf portable/include portable/lib portable/share/man
-          rm -f portable/libmgba.a portable/libmgba.dll portable/libmgba.dll.a
-          test -f portable/mGBA.exe
-          test -f portable/mgba-sdl.exe
-          test ! -f portable/libmgba.dll
-
-          deploy_mingw_deps() {
-            local binary="$1"
-            local dlls
-            dlls=$(ntldd -R "$binary" | grep -i mingw | cut -d'>' -f2 | sed -e 's/(0x[0-9a-f]\+)//' -e 's/^ \+//' -e 's/ \+$//' -e 's,\\,/,g' || true)
-            if [ -n "$dlls" ]; then
-              cp -vu $dlls portable/
-            fi
-          }
-
-          deploy_mingw_deps "$PWD/portable/mGBA.exe"
-          deploy_mingw_deps "$PWD/portable/mgba-sdl.exe"
-
-          WINDEPLOYQT=$(command -v windeployqt-qt5 || command -v windeployqt || true)
-          test -n "$WINDEPLOYQT"
-          "$WINDEPLOYQT" --no-opengl-sw --no-svg --release --dir "$PWD/portable" "$PWD/portable/mGBA.exe"
-
-          find portable -maxdepth 1 -type f \( -iname '*.exe' -o -iname '*.dll' \) -print0 | \
-            xargs -0 -r -n1 sh -c 'strip --strip-unneeded "$1" 2>/dev/null || true' _
-
-          test -f portable/Qt5Core.dll
-          test -f portable/libstdc++-6.dll
-          test -f portable/SDL2.dll
-          test -f portable/platforms/qwindows.dll
-          test ! -f portable/libmgba.dll
-
-          echo "Portable files: $(find portable -type f | wc -l)"
-          echo "Portable DLLs: $(find portable -type f -iname '*.dll' | wc -l)"
-          du -sh portable
-          echo 'Largest packaged files:'
-          find portable -type f -printf '%s %P\n' | sort -nr | head -40
-
-      - name: Smoke-test compact package
+      - name: Assemble minimal portable directory
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $portable = Join-Path $PWD 'portable'
-          foreach ($required in @('mGBA.exe','mgba-sdl.exe','Qt5Core.dll','libstdc++-6.dll','SDL2.dll','platforms\qwindows.dll')) {
-            if (-not (Test-Path (Join-Path $portable $required))) { throw "$required missing" }
-          }
-          if (Test-Path (Join-Path $portable 'libmgba.dll')) { throw 'libmgba.dll unexpectedly present; core is not static' }
+          Remove-Item $portable -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $portable | Out-Null
 
-          function Test-PortableExe([string]$exeName) {
-            $exe = Join-Path $portable $exeName
-            Write-Host "Testing $exeName with isolated PATH..."
-            $p = Start-Process -FilePath $exe -ArgumentList '--version' -WorkingDirectory $portable -Wait -PassThru
-            Write-Host "$exeName exit code: $($p.ExitCode)"
-            if ($p.ExitCode -ne 0) { throw "$exeName --version failed with $($p.ExitCode)" }
-          }
+          $qtExe = Get-ChildItem build-release -Recurse -Filter 'mGBA.exe' | Where-Object { $_.FullName -notmatch '_CPack_Packages' } | Select-Object -First 1
+          $sdlExe = Get-ChildItem build-release -Recurse -Filter 'mgba-sdl.exe' | Where-Object { $_.FullName -notmatch '_CPack_Packages' } | Select-Object -First 1
+          if (-not $qtExe) { throw 'mGBA.exe not found' }
+          if (-not $sdlExe) { throw 'mgba-sdl.exe not found' }
+          Copy-Item $qtExe.FullName (Join-Path $portable 'mGBA.exe')
+          Copy-Item $sdlExe.FullName (Join-Path $portable 'mgba-sdl.exe')
 
-          $oldPath = $env:PATH
-          try {
-            $env:PATH = "$portable;C:\Windows\System32;C:\Windows"
-            Test-PortableExe 'mgba-sdl.exe'
-            Test-PortableExe 'mGBA.exe'
-          } finally {
-            $env:PATH = $oldPath
+          foreach ($doc in @('LICENSE','CHANGES')) {
+            if (Test-Path $doc) { Copy-Item $doc (Join-Path $portable ($doc + '.txt')) }
           }
 
-      - name: Create compact ZIP and official-style 7z
+          $windeployqt = (Get-Command windeployqt.exe -ErrorAction Stop).Source
+          & $windeployqt --release --compiler-runtime --no-translations --no-opengl-sw --no-system-d3d-compiler --no-svg $portable\mGBA.exe
+          if ($LASTEXITCODE -ne 0) { throw 'windeployqt failed' }
+
+          $vcpkgBin = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed\x64-windows-release\bin'
+          if (-not (Test-Path $vcpkgBin)) { throw "vcpkg bin not found: $vcpkgBin" }
+
+          function Get-Dependents([string]$binary) {
+            $lines = & dumpbin.exe /dependents $binary 2>$null
+            foreach ($line in $lines) {
+              if ($line -match '^\s+([^\s]+\.dll)\s*$') { $matches[1] }
+            }
+          }
+
+          $systemDlls = @(
+            'KERNEL32.dll','USER32.dll','GDI32.dll','ADVAPI32.dll','SHELL32.dll','OLE32.dll','OLEAUT32.dll',
+            'COMDLG32.dll','COMCTL32.dll','WS2_32.dll','WINMM.dll','IMM32.dll','VERSION.dll','SHLWAPI.dll',
+            'DWMAPI.dll','UXTHEME.dll','SETUPAPI.dll','CRYPT32.dll','SECUR32.dll','RPCRT4.dll','IPHLPAPI.dll',
+            'DNSAPI.dll','WINHTTP.dll','WTSAPI32.dll','POWRPROF.dll','USERENV.dll','MSVCRT.dll','NTDLL.dll'
+          ) | ForEach-Object { $_.ToLowerInvariant() }
+
+          $queue = [System.Collections.Generic.Queue[string]]::new()
+          Get-ChildItem $portable -Recurse -File | Where-Object { $_.Extension -in '.exe','.dll' } | ForEach-Object { $queue.Enqueue($_.FullName) }
+          $scanned = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+
+          while ($queue.Count -gt 0) {
+            $binary = $queue.Dequeue()
+            if (-not $scanned.Add($binary)) { continue }
+            foreach ($dep in (Get-Dependents $binary)) {
+              $lower = $dep.ToLowerInvariant()
+              if ($systemDlls -contains $lower -or $lower -match '^api-ms-win-' -or $lower -match '^ext-ms-') { continue }
+              if (Get-ChildItem $portable -Recurse -Filter $dep -ErrorAction SilentlyContinue | Select-Object -First 1) { continue }
+              $src = Join-Path $vcpkgBin $dep
+              if (Test-Path $src) {
+                $dst = Join-Path $portable $dep
+                Copy-Item $src $dst
+                $queue.Enqueue($dst)
+                Write-Host "Bundled vcpkg runtime: $dep"
+              }
+            }
+          }
+
+          if (Test-Path (Join-Path $portable 'libmgba.dll')) { throw 'libmgba.dll unexpectedly present' }
+          if (-not (Test-Path (Join-Path $portable 'platforms\qwindows.dll'))) { throw 'Qt platform plugin missing' }
+
+          Write-Host 'Packaged files:'
+          Get-ChildItem $portable -Recurse -File | Sort-Object Length -Descending | Select-Object Length,FullName | Format-Table -AutoSize
+          $bytes = (Get-ChildItem $portable -Recurse -File | Measure-Object Length -Sum).Sum
+          Write-Host ("Portable uncompressed: {0:N2} MiB" -f ($bytes / 1MB))
+
+      - name: Smoke-test isolated package
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $zip = Join-Path $PWD 'mGBA-FRLG-RevA-Windows-x64.zip'
-          $seven = Join-Path $PWD 'mGBA-FRLG-RevA-win64.7z'
-          Remove-Item $zip,$seven -Force -ErrorAction SilentlyContinue
+          $portable = Join-Path $PWD 'portable'
+          function Test-Exe([string]$name) {
+            $exe = Join-Path $portable $name
+            if (-not (Test-Path $exe)) { throw "$name missing" }
+            $oldPath = $env:PATH
+            try {
+              $env:PATH = "$portable;C:\Windows\System32;C:\Windows"
+              $p = Start-Process -FilePath $exe -ArgumentList '--version' -WorkingDirectory $portable -Wait -PassThru
+              if ($p.ExitCode -ne 0) { throw "$name --version exited $($p.ExitCode)" }
+            } finally {
+              $env:PATH = $oldPath
+            }
+          }
+          Test-Exe 'mgba-sdl.exe'
+          Test-Exe 'mGBA.exe'
 
-          Compress-Archive -Path '.\portable\*' -DestinationPath $zip -CompressionLevel Optimal
-          & 7z a -t7z -mx=9 -ms=on $seven '.\portable\*'
+      - name: Create official-style 7z package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $asset = Join-Path $PWD 'mGBA-FRLG-RevA-win64.7z'
+          Remove-Item $asset -Force -ErrorAction SilentlyContinue
+          & 7z a -t7z -mx=9 -m0=lzma2 -ms=on $asset '.\portable\*'
           if ($LASTEXITCODE -ne 0) { throw '7z packaging failed' }
+          $item = Get-Item $asset
+          $hash = Get-FileHash $asset -Algorithm SHA256
+          Write-Host ("7z size: {0:N2} MiB" -f ($item.Length / 1MB))
+          $item | Select-Object Name,Length | Format-Table -AutoSize
+          $hash | Format-Table -AutoSize
 
-          Get-Item $zip,$seven | Select-Object Name,Length | Format-Table -AutoSize
-          Get-FileHash $zip,$seven -Algorithm SHA256 | Format-Table -AutoSize
-
-      - name: Upload compact artifacts
+      - name: Upload verified artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mGBA-FRLG-RevA-Windows-x64-portable
-          path: |
-            mGBA-FRLG-RevA-Windows-x64.zip
-            mGBA-FRLG-RevA-win64.7z
+          name: mGBA-FRLG-RevA-win64-msvc
+          path: mGBA-FRLG-RevA-win64.7z
           if-no-files-found: error
 
-      - name: Publish GitHub release
+      - name: Publish compact GitHub release asset
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -203,30 +204,11 @@ jobs:
           $repo = '969981/mgba'
           $tag = 'revA-20260930'
           $expected = 'fadbf93a565a5bd0b3e7f12b848fc208064a94f1'
-          $assets = @('.\mGBA-FRLG-RevA-Windows-x64.zip','.\mGBA-FRLG-RevA-win64.7z')
-          $title = 'mGBA FRLG RevA (2026-09-30)'
-          $notes = 'FRLG RevA build based on 969981/mgba master c3c8e5e with the RevA commits rebased on top as c809ee643 and fadbf93a5. Windows x64 uses the normal Qt GUI and SDL frontend, static mGBA core, LTO, bundled minizip and stripped runtime files. FFmpeg video recording/encoding is disabled to avoid bundling the very large modern codec dependency tree; normal emulation, saves, debugging and GUI use remain. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
-
-          $tagSha = gh api "repos/$repo/git/ref/tags/$tag" --jq '.object.sha' 2>$null
-          if ($LASTEXITCODE -eq 0) {
-            $tagSha = $tagSha.Trim()
-            if ($tagSha -ne $expected) { throw "Tag $tag points to $tagSha, expected $expected" }
-          } else {
-            gh api --method POST "repos/$repo/git/refs" -f "ref=refs/tags/$tag" -f "sha=$expected" | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "Failed to create tag $tag at $expected" }
-          }
-
-          gh release view $tag --repo $repo 2>$null | Out-Null
-          if ($LASTEXITCODE -eq 0) {
-            foreach ($asset in $assets) {
-              gh release upload $tag $asset --repo $repo --clobber
-              if ($LASTEXITCODE -ne 0) { throw "Failed to upload $asset" }
-            }
-            gh release edit $tag --repo $repo --title $title --notes $notes
-            if ($LASTEXITCODE -ne 0) { throw 'Failed to update release metadata' }
-          } else {
-            gh release create $tag $assets --repo $repo --verify-tag --title $title --notes $notes
-            if ($LASTEXITCODE -ne 0) { throw 'Failed to create release' }
-          }
-
-          gh release view $tag --repo $repo --json url,tagName,targetCommitish,assets
+          $asset = '.\mGBA-FRLG-RevA-win64.7z'
+          $tagSha = (gh api "repos/$repo/git/ref/tags/$tag" --jq '.object.sha').Trim()
+          if ($tagSha -ne $expected) { throw "Tag $tag points to $tagSha, expected $expected" }
+          gh release upload $tag $asset --repo $repo --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Release upload failed' }
+          gh release edit $tag --repo $repo --notes 'FRLG RevA multi-platform release. Windows x64 is packaged with an official-style MSVC + vcpkg + Qt MSVC toolchain instead of an MSYS2/MinGW runtime tree. The mGBA core is static and LTO-enabled; FFmpeg, Lua, SQLite, ELF and other nonessential distribution dependencies are disabled for this build. The Windows release publishes a solid 7z package as the primary asset to keep size and file count close to upstream release practice. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
+          if ($LASTEXITCODE -ne 0) { throw 'Release metadata update failed' }
+          gh release view $tag --repo $repo --json url,assets
