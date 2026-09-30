@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - revA-bootstrap
+    paths:
+      - .github/workflows/reva-all-platforms.yml
   workflow_dispatch:
 
 permissions:
@@ -19,7 +21,7 @@ env:
 
 jobs:
   win32:
-    name: Windows x86
+    name: Windows x86 SDL compatibility build
     runs-on: windows-latest
     continue-on-error: true
     steps:
@@ -35,77 +37,71 @@ jobs:
         with:
           msystem: MINGW32
           update: true
+          suppress-deprecation-warnings: msystem-mingw32
           install: >-
             base-devel
             git
-            unzip
             p7zip
             mingw-w64-i686-cmake
-            mingw-w64-i686-ffmpeg
             mingw-w64-i686-gcc
-            mingw-w64-i686-gdb
-            mingw-w64-i686-libelf
-            mingw-w64-i686-libepoxy
-            mingw-w64-i686-libzip
-            mingw-w64-i686-lua
             mingw-w64-i686-pkgconf
-            mingw-w64-i686-qt5
             mingw-w64-i686-SDL2
+            mingw-w64-i686-zlib
             mingw-w64-i686-ntldd-git
-      - name: Build and create upstream components
+      - name: Build compact SDL frontend
         shell: msys2 {0}
         run: |
           set -euxo pipefail
-          cmake -S . -B build -G "MSYS Makefiles" -DCMAKE_BUILD_TYPE=Release -DDISTBUILD=ON -DBUILD_STATIC=ON -DBUILD_SHARED=OFF
+          cmake -S . -B build -G "MSYS Makefiles" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDISTBUILD=ON \
+            -DBUILD_STATIC=ON \
+            -DBUILD_SHARED=OFF \
+            -DBUILD_QT=OFF \
+            -DBUILD_SDL=ON \
+            -DBUILD_GL=OFF \
+            -DBUILD_GLES2=OFF \
+            -DBUILD_GLES3=OFF \
+            -DUSE_FFMPEG=OFF \
+            -DUSE_MINIZIP=OFF \
+            -DUSE_LIBZIP=OFF \
+            -DUSE_PNG=OFF \
+            -DUSE_EPOXY=OFF \
+            -DUSE_ELF=OFF \
+            -DUSE_LUA=OFF \
+            -DUSE_SQLITE3=OFF \
+            -DUSE_JSON_C=OFF \
+            -DUSE_FREETYPE=OFF \
+            -DUSE_LZMA=OFF \
+            -DUSE_DISCORD_RPC=OFF
           cmake --build build --parallel 2
-          (cd build && cpack -G ZIP)
-          ls -lah build/*-base.zip build/*-qt.zip build/*-sdl.zip
-      - name: Assemble compact package
-        shell: msys2 {0}
-        run: |
-          set -euxo pipefail
+          test -f build/mgba-sdl.exe
+
           rm -rf portable
           mkdir portable
-          for component in base qt sdl; do
-            pkg=$(find build -maxdepth 1 -type f -iname "*-${component}.zip" | head -n1)
-            test -n "$pkg"
-            unzip -qo "$pkg" -d portable
-          done
-          rm -rf portable/include portable/lib portable/share/man
-          rm -f portable/libmgba.a portable/libmgba.dll portable/libmgba.dll.a
-          test -f portable/mGBA.exe
-          test -f portable/mgba-sdl.exe
+          cp build/mgba-sdl.exe portable/
+          cp LICENSE portable/
+          cp README.md portable/
 
-          deploy_mingw_deps() {
-            local binary="$1"
-            local dlls
-            dlls=$(ntldd -R "$binary" | grep -i mingw | cut -d'>' -f2 | sed -e 's/(0x[0-9a-f]\+)//' -e 's/^ \+//' -e 's/ \+$//' -e 's,\\,/,g' || true)
-            if [ -n "$dlls" ]; then cp -vu $dlls portable/; fi
-          }
-          deploy_mingw_deps "$PWD/portable/mGBA.exe"
-          deploy_mingw_deps "$PWD/portable/mgba-sdl.exe"
-          WINDEPLOYQT=$(command -v windeployqt-qt5 || command -v windeployqt || true)
-          test -n "$WINDEPLOYQT"
-          "$WINDEPLOYQT" --no-opengl-sw --no-svg --release --dir "$PWD/portable" "$PWD/portable/mGBA.exe"
+          dlls=$(ntldd -R "$PWD/portable/mgba-sdl.exe" | grep -i mingw | cut -d'>' -f2 | sed -e 's/(0x[0-9a-f]\+)//' -e 's/^ \+//' -e 's/ \+$//' -e 's,\\,/,g' || true)
+          if [ -n "$dlls" ]; then cp -vu $dlls portable/; fi
           find portable -maxdepth 1 -type f \( -iname '*.exe' -o -iname '*.dll' \) -print0 | xargs -0 -r -n1 sh -c 'strip --strip-unneeded "$1" 2>/dev/null || true' _
-          test -f portable/platforms/qwindows.dll
-          7z a -t7z -mx=9 -ms=on mGBA-FRLG-RevA-win32.7z ./portable/*
-          ls -lh mGBA-FRLG-RevA-win32.7z
+          test -f portable/SDL2.dll
+          7z a -t7z -mx=9 -ms=on mGBA-FRLG-RevA-win32-sdl.7z ./portable/*
+          ls -lh mGBA-FRLG-RevA-win32-sdl.7z
       - name: Smoke test
         shell: pwsh
         run: |
           $old = $env:PATH
           try {
             $env:PATH = "$PWD\portable;C:\Windows\System32;C:\Windows"
-            foreach ($exe in @('mgba-sdl.exe','mGBA.exe')) {
-              $p = Start-Process -FilePath (Join-Path $PWD "portable\$exe") -ArgumentList '--version' -WorkingDirectory (Join-Path $PWD 'portable') -Wait -PassThru
-              if ($p.ExitCode -ne 0) { throw "$exe failed: $($p.ExitCode)" }
-            }
+            $p = Start-Process -FilePath (Join-Path $PWD 'portable\mgba-sdl.exe') -ArgumentList '--version' -WorkingDirectory (Join-Path $PWD 'portable') -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "mgba-sdl.exe failed: $($p.ExitCode)" }
           } finally { $env:PATH = $old }
       - uses: actions/upload-artifact@v4
         with:
           name: release-win32
-          path: mGBA-FRLG-RevA-win32.7z
+          path: mGBA-FRLG-RevA-win32-sdl.7z
           if-no-files-found: error
 
   linux:
@@ -122,11 +118,17 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build qtbase5-dev qttools5-dev-tools libsdl2-dev libepoxy-dev libzip-dev libelf-dev libavcodec-dev libavfilter-dev libavformat-dev libavutil-dev libswscale-dev liblua5.4-dev libpng-dev zlib1g-dev libsqlite3-dev libedit-dev libfreetype6-dev libjson-c-dev liblzma-dev
+          sudo apt-get install -y cmake ninja-build qtbase5-dev qttools5-dev-tools libsdl2-dev libepoxy-dev libminizip-dev libelf-dev libavcodec-dev libavfilter-dev libavformat-dev libavutil-dev libswscale-dev liblua5.4-dev libpng-dev zlib1g-dev libsqlite3-dev libedit-dev libfreetype6-dev libjson-c-dev liblzma-dev
       - name: Build and package
         run: |
           set -euxo pipefail
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDISTBUILD=ON -DBUILD_STATIC=ON -DBUILD_SHARED=OFF
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDISTBUILD=ON \
+            -DBUILD_STATIC=ON \
+            -DBUILD_SHARED=OFF \
+            -DUSE_LIBZIP=OFF \
+            -DUSE_MINIZIP=ON
           cmake --build build --parallel 2
           rm -rf stage
           cmake --install build --prefix "$PWD/stage"
@@ -208,8 +210,12 @@ jobs:
           ref: revA
           fetch-depth: 0
       - name: Verify source
-        run: test "$(git rev-parse HEAD)" = "$REV_SHA"
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" = "$REV_SHA"
       - name: Install build tools
+        shell: bash
         run: |
           apt-get update
           apt-get install -y cmake ninja-build p7zip-full
@@ -243,7 +249,10 @@ jobs:
           ref: revA
           fetch-depth: 0
       - name: Verify source
-        run: test "$(git rev-parse HEAD)" = "$REV_SHA"
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" = "$REV_SHA"
       - name: Install build tools
         shell: bash
         run: |
