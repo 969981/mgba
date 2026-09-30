@@ -36,7 +36,7 @@ jobs:
         run: |
           if command -v apt-get >/dev/null; then apt-get update && apt-get install -y cmake ninja-build p7zip-full; fi
           if command -v apk >/dev/null; then apk add --no-cache cmake ninja p7zip; fi
-      - name: Build without incompatible libzip/zstd path
+      - name: Build with bundled minizip
         shell: bash
         run: |
           set -euxo pipefail
@@ -45,7 +45,7 @@ jobs:
             -DDISTBUILD=ON \
             -DCMAKE_TOOLCHAIN_FILE=src/platform/psp2/CMakeToolchain.vitasdk \
             -DUSE_LIBZIP=OFF \
-            -DUSE_MINIZIP=ON \
+            -DUSE_MINIZIP=OFF \
             -DUSE_LZMA=OFF
           cmake --build build --parallel 2
 
