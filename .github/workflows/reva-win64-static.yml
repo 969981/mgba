@@ -1,4 +1,4 @@
-# RevA Windows static release pipeline v4: UCRT64 + restored SQLite3 + real GUI launch gate
+# RevA Windows static release pipeline v5: UCRT64 + restored SQLite3 + real GUI launch gate
 name: Build and publish FRLG RevA static Windows x64
 
 on:
@@ -37,21 +37,7 @@ jobs:
           $actual = (git rev-parse HEAD).Trim()
           if ($actual -ne $env:EXPECTED_REVA) { throw "RevA source mismatch: $actual" }
           git log --oneline --decorate -3
-
-      - name: Apply static-startup safety guard
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $path = 'src/platform/qt/Window.cpp'
-          $text = [IO.File]::ReadAllText($path)
-          $old = "`tcentralWidget()->unsetCursor();"
-          $new = "`tif (centralWidget()) {`n`t`tcentralWidget()->unsetCursor();`n`t}"
-          $count = ([regex]::Matches($text, [regex]::Escape($old))).Count
-          if ($count -ne 1) { throw "Expected exactly one centralWidget()->unsetCursor() site, found $count" }
-          $text = $text.Replace($old, $new)
-          [IO.File]::WriteAllText($path, $text, [Text.UTF8Encoding]::new($false))
-          git diff --check
-          git diff -- src/platform/qt/Window.cpp
+          if ((git status --porcelain)) { throw 'RevA checkout is unexpectedly dirty before build' }
 
       - name: Set up UCRT64 static toolchain
         uses: msys2/setup-msys2@v2
@@ -90,9 +76,9 @@ jobs:
             ls -lh "$lib"
           done
 
-          # Keep every direct runtime dependency static. In particular, restoring
-          # SQLite3 also restores the normal startup path that attaches a central
-          # widget before Window::setLogo() runs.
+          # Keep direct runtimes static. Restoring SQLite3 also restores the
+          # normal Window startup path that attaches a central widget before
+          # Window::setLogo() runs; do not mutate RevA source during packaging.
           HIDDEN=/ucrt64/lib/.reva-hidden-import-libs
           mkdir -p "$HIDDEN"
           for name in png16 ssl crypto zstd z SDL2 epoxy sqlite3; do
@@ -145,6 +131,7 @@ jobs:
 
           echo '==== SQLite configuration ===='
           grep -Ei '^(USE_SQLITE3|SQLite3_|SQLITE3_).*=' build-static/CMakeCache.txt || true
+          grep -q '^USE_SQLITE3:BOOL=ON$' build-static/CMakeCache.txt
 
       - name: Build static Windows targets
         shell: msys2 {0}
@@ -249,6 +236,6 @@ jobs:
           if ($tagSha -ne $env:EXPECTED_REVA) { throw "Tag $tag points to $tagSha, expected $env:EXPECTED_REVA" }
           gh release upload $tag $asset --repo $repo --clobber
           if ($LASTEXITCODE -ne 0) { throw 'Release upload failed' }
-          gh release edit $tag --repo $repo --notes 'FRLG RevA multi-platform release. Windows x64 is built with UCRT64 + static Qt 5, with SQLite3 game-library support restored and all direct runtimes linked statically. The Windows asset is only published after PE import auditing and a real no-argument GUI launch that produces a window. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
+          gh release edit $tag --repo $repo --notes 'FRLG RevA multi-platform release. Windows x64 is built from the exact RevA tag with UCRT64 + static Qt 5 and SQLite3 game-library support restored. No source mutation is performed during packaging. The Windows asset is only published after PE import auditing and a real no-argument GUI launch that produces a window. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
           if ($LASTEXITCODE -ne 0) { throw 'Release metadata update failed' }
           gh release view $tag --repo $repo --json url,assets
