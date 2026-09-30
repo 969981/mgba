@@ -1,4 +1,4 @@
-name: Rebase FRLG RevA and build Windows x64
+name: Finalize FRLG RevA portable release
 
 on:
   push:
@@ -6,10 +6,11 @@ on:
       - revA-bootstrap
 
 permissions:
+  actions: read
   contents: write
 
 jobs:
-  rebase-build-release:
+  finalize-release:
     runs-on: windows-latest
     steps:
       - name: Checkout bootstrap branch
@@ -17,85 +18,123 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up MSYS2 MinGW64
+      - name: Download successful RevA build artifact
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force downloaded | Out-Null
+          gh run download 36659361402 --repo 969981/mgba --name mGBA-FRLG-RevA-Windows-x64 --dir downloaded
+          Get-ChildItem downloaded
+
+      - name: Set up MSYS2 runtime packaging tools
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
           update: true
           install: >-
-            base-devel
-            git
-            mingw-w64-x86_64-cmake
+            unzip
             mingw-w64-x86_64-ffmpeg
             mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-gdb
             mingw-w64-x86_64-libelf
             mingw-w64-x86_64-libepoxy
             mingw-w64-x86_64-libzip
             mingw-w64-x86_64-lua
-            mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-qt5
+            mingw-w64-x86_64-qt5-base
+            mingw-w64-x86_64-qt5-multimedia
+            mingw-w64-x86_64-qt5-tools
             mingw-w64-x86_64-SDL2
             mingw-w64-x86_64-ntldd-git
 
-      - name: Rebase the two RevA commits onto latest master
+      - name: Assemble portable Windows x64 directory
         shell: msys2 {0}
         run: |
           set -euxo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote remove aryan 2>/dev/null || true
-          git remote add aryan https://github.com/Aryan10/mgba-frlg-revA.git
-          git fetch aryan master
-          git fetch origin master revA
-          git reset --hard HEAD
-          git switch -C revA origin/master
-          git cherry-pick 0102d3e9db8971ee443857044a1c3b607b0df6e4
-          git cherry-pick 9fd56025c6fc95c6edf6b97e3ad06805655d7849
-          REVA_HEAD=$(git rev-parse HEAD)
-          echo "REVA_HEAD=$REVA_HEAD" >> "$GITHUB_ENV"
-          git log --oneline --decorate -4
-          git push origin revA
+          rm -rf cpack-extracted portable
+          mkdir -p cpack-extracted portable
+          INNER_ZIP=$(find downloaded -maxdepth 2 -type f -iname '*.zip' | head -n 1)
+          test -n "$INNER_ZIP"
+          unzip -q "$INNER_ZIP" -d cpack-extracted
+          ROOT=$(find cpack-extracted -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          test -n "$ROOT"
+          cp -a "$ROOT"/. portable/
+          rm -rf portable/include
+          rm -f portable/libmgba.dll.a
+          test -f portable/mGBA.exe
+          test -f portable/mgba-sdl.exe
+          test -f portable/libmgba.dll
 
-      - name: Configure mGBA
-        shell: msys2 {0}
+          WINDEPLOYQT=/mingw64/bin/windeployqt-qt5.exe
+          test -x "$WINDEPLOYQT"
+          "$WINDEPLOYQT" --no-opengl-sw --no-svg --release --dir "$PWD/portable" "$PWD/portable/mGBA.exe"
+
+          find portable -type f \( -iname '*.exe' -o -iname '*.dll' \) -print0 |
+            while IFS= read -r -d '' bin; do ntldd -R "$bin" || true; done |
+            grep -i mingw |
+            cut -d'>' -f2 |
+            sed -e 's/(0x[0-9a-fA-F]\+)//' -e 's/^ \+//' -e 's/ \+$//' -e 's,\\,/,g' |
+            sort -u > runtime-dlls.txt
+
+          while IFS= read -r dll; do
+            if [ -f "$dll" ]; then
+              cp -f "$dll" portable/
+            fi
+          done < runtime-dlls.txt
+
+          test -f portable/Qt5Core.dll
+          test -f portable/libstdc++-6.dll
+          test -f portable/SDL2.dll
+          test -f portable/platforms/qwindows.dll
+          echo "Runtime files: $(find portable -type f | wc -l)"
+          echo "DLL files: $(find portable -type f -iname '*.dll' | wc -l)"
+
+      - name: Smoke-test portable binaries and create ZIP
+        shell: pwsh
         run: |
-          set -euxo pipefail
-          cmake -S . -B build -G "MSYS Makefiles" -DCMAKE_BUILD_TYPE=Release
+          $ErrorActionPreference = 'Stop'
+          $portable = Join-Path $PWD 'portable'
+          if (-not (Test-Path "$portable\platforms\qwindows.dll")) { throw 'qwindows.dll missing' }
+          if (-not (Test-Path "$portable\Qt5Core.dll")) { throw 'Qt5Core.dll missing' }
+          if (-not (Test-Path "$portable\libstdc++-6.dll")) { throw 'libstdc++-6.dll missing' }
+          if (-not (Test-Path "$portable\SDL2.dll")) { throw 'SDL2.dll missing' }
 
-      - name: Build mGBA
-        shell: msys2 {0}
-        run: |
-          set -euxo pipefail
-          cmake --build build --parallel 2
+          $oldPath = $env:PATH
+          $env:PATH = "$portable;C:\Windows\System32;C:\Windows"
+          & "$portable\mGBA.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "mGBA.exe --version failed with $LASTEXITCODE" }
+          & "$portable\mgba-sdl.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "mgba-sdl.exe --version failed with $LASTEXITCODE" }
+          $env:PATH = $oldPath
 
-      - name: Package distributable ZIP
-        shell: msys2 {0}
-        run: |
-          set -euxo pipefail
-          cd build
-          cpack -G ZIP
-          ls -lah *.zip
+          $zip = Join-Path $PWD 'mGBA-FRLG-RevA-Windows-x64.zip'
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path "$portable\*" -DestinationPath $zip -CompressionLevel Optimal
+          Get-Item $zip | Format-List Name,Length
+          Get-FileHash $zip -Algorithm SHA256
 
-      - name: Upload build artifact
+      - name: Upload final portable artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mGBA-FRLG-RevA-Windows-x64
-          path: build/*.zip
+          name: mGBA-FRLG-RevA-Windows-x64-portable
+          path: mGBA-FRLG-RevA-Windows-x64.zip
           if-no-files-found: error
 
-      - name: Create GitHub release
+      - name: Publish GitHub release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
           $tag = 'revA-20260930'
-          gh release view $tag 2>$null | Out-Null
+          $expected = 'fadbf93a565a5bd0b3e7f12b848fc208064a94f1'
+          $actual = (gh api "repos/969981/mgba/git/ref/tags/$tag" --jq '.object.sha').Trim()
+          if ($actual -ne $expected) { throw "Tag $tag points to $actual, expected $expected" }
+
+          gh release view $tag --repo 969981/mgba 2>$null | Out-Null
           if ($LASTEXITCODE -eq 0) {
-            gh release delete $tag --yes --cleanup-tag
+            gh release delete $tag --repo 969981/mgba --yes
           }
-          git tag -f $tag $env:REVA_HEAD
-          git push origin "refs/tags/$tag" --force
-          $assets = Get-ChildItem build -Filter *.zip | ForEach-Object { $_.FullName }
-          gh release create $tag @assets --title 'mGBA FRLG RevA (2026-09-30)' --notes "Built from 969981/mgba master c3c8e5e with Aryan10/mgba-frlg-revA commits 0102d3e and 9fd5602 rebased on top. Includes the SWI 0x48 FRLG RevA save fix."
+
+          gh release create $tag '.\mGBA-FRLG-RevA-Windows-x64.zip' --repo 969981/mgba --verify-tag --title 'mGBA FRLG RevA (2026-09-30)' --notes 'Windows x64 portable build based on 969981/mgba master c3c8e5e, with Aryan10/mgba-frlg-revA commits 0102d3e and 9fd5602 rebased on top as c809ee643 and fadbf93a5. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
+          gh release view $tag --repo 969981/mgba --json url,tagName,targetCommitish,assets
