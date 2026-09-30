@@ -1,4 +1,4 @@
-# RevA Windows release pipeline v7: official mGBA windows:w64 Docker toolchain
+# RevA Windows release pipeline v8: official mGBA windows:w64 Docker toolchain
 name: Build and publish FRLG RevA official Windows x64
 
 on:
@@ -41,6 +41,35 @@ jobs:
           test "$actual" = "$EXPECTED_REVA"
           test -z "$(git status --porcelain)"
           git log --oneline --decorate -3
+
+      - name: Suppress unimplemented BIOS popup
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/platform/qt/Window.cpp")
+          text = path.read_text(encoding="utf-8")
+          needle = "\tconnect(m_controller.get(), &CoreController::unimplementedBiosCall, this, &Window::unimplementedBiosCall);\n"
+          replacement = "\t// RevA custom build: suppress the Qt warning dialog for unimplemented BIOS calls.\n"
+
+          count = text.count(needle)
+          if count != 1:
+              raise SystemExit(f"Expected exactly one unimplementedBiosCall Qt connection, found {count}")
+
+          text = text.replace(needle, replacement, 1)
+          path.write_text(text, encoding="utf-8")
+
+          updated = path.read_text(encoding="utf-8")
+          if needle in updated:
+              raise SystemExit("unimplementedBiosCall Qt connection is still present after patch")
+          if replacement not in updated:
+              raise SystemExit("popup suppression marker missing after patch")
+          PY
+
+          git diff --check
+          git diff -- src/platform/qt/Window.cpp
 
       - name: Pull official mGBA Windows x64 image
         shell: bash
@@ -234,7 +263,7 @@ jobs:
           gh release upload $tag $asset --repo $repo --clobber
           if ($LASTEXITCODE -ne 0) { throw 'Release upload failed' }
 
-          gh release edit $tag --repo $repo --notes 'FRLG RevA multi-platform release. Windows x64 is built from the exact RevA commit with the official mGBA mgba/windows:w64 Docker toolchain and the same Windows Buildbot distribution flags: static build, Qt/SDL/FFmpeg enabled, LTO disabled, and official CPack base/SDL/Qt components merged before 7z packaging. The Windows asset is published only after the resulting archive is extracted and the GUI is actually launched on a clean Windows Server runner. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
+          gh release edit $tag --repo $repo --notes 'FRLG RevA multi-platform release. Windows x64 is built from the exact RevA commit with the official mGBA mgba/windows:w64 Docker toolchain and the same Windows Buildbot distribution flags: static build, Qt/SDL/FFmpeg enabled, LTO disabled, and official CPack base/SDL/Qt components merged before 7z packaging. The Windows Qt frontend additionally suppresses the unimplemented BIOS-call warning dialog by disconnecting that UI signal during the release build; BIOS emulation behavior itself is unchanged. The Windows asset is published only after the resulting archive is extracted and the GUI is actually launched on a clean Windows Server runner. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
           if ($LASTEXITCODE -ne 0) { throw 'Release metadata update failed' }
 
           Get-FileHash $asset -Algorithm SHA256 | Format-Table -AutoSize
