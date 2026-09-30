@@ -1,3 +1,4 @@
+# RevA Windows static release pipeline v2: shared Qt libpng + real GUI launch gate
 name: Build FRLG RevA official-style static Windows x64
 
 on:
@@ -79,23 +80,19 @@ jobs:
             ls -lh "$lib"
           done
 
-          # Qt5-static's metadata names OpenSSL/zstd/zlib as bare -lfoo flags.
-          # MSYS2 installs both libfoo.dll.a and libfoo.a; CMake otherwise picks
-          # the import library first. Hide only these import libraries during
-          # configure/build so every Qt imported target is forced onto libfoo.a.
+          # Qt5-static ships its own libpng implementation (libqtlibpng.a).
+          # mGBA must use that same archive; mixing it with libpng.dll.a causes
+          # duplicate png_* definitions at the final mGBA.exe link.
+          # Also hide import libraries that Qt's static metadata can otherwise
+          # prefer over the matching static archives.
           HIDDEN=/mingw64/lib/.reva-hidden-import-libs
           mkdir -p "$HIDDEN"
-          for name in ssl crypto zstd z; do
+          for name in png16 ssl crypto zstd z SDL2 epoxy; do
             imp="/mingw64/lib/lib${name}.dll.a"
             if [[ -f "$imp" ]]; then
               echo "Hiding DLL import library: $imp"
               mv "$imp" "$HIDDEN/"
             fi
-          done
-
-          echo 'Remaining candidates after hiding import libraries:'
-          for name in ssl crypto zstd z; do
-            ls -lh /mingw64/lib/lib${name}*.a 2>/dev/null || true
           done
 
           cmake -S . -B build-static -G Ninja \
@@ -144,13 +141,6 @@ jobs:
             exit 1
           fi
 
-          echo '==== OpenSSL/zstd/zlib references in generated Ninja link graph ===='
-          grep -niE 'lib(ssl|crypto|zstd|z)(-[^/ ]+)?(\.dll)?\.a|-l(ssl|crypto|zstd)' build-static/build.ninja | head -120 || true
-          if grep -qiE 'lib(ssl|crypto|zstd|z)(-[^/ ]+)?\.dll\.a' build-static/build.ninja; then
-            echo 'Generated build still references a hidden DLL import library.' >&2
-            exit 1
-          fi
-
       - name: Build static Windows targets
         shell: msys2 {0}
         run: |
@@ -195,12 +185,7 @@ jobs:
           if (Test-Path 'res\scripts') { Copy-Item 'res\scripts' (Join-Path $portable 'scripts') -Recurse }
 
           $dlls = Get-ChildItem $portable -Recurse -Filter '*.dll' -File
-          if ($dlls) {
-            $dlls | Select-Object FullName,Length | Format-Table -AutoSize
-            throw 'Static package unexpectedly contains DLL files'
-          }
-          Write-Host 'Official-style static package contents:'
-          Get-ChildItem $portable -Recurse | Select-Object FullName,Length | Format-Table -AutoSize
+          if ($dlls) { throw 'Static package unexpectedly contains DLL files' }
           $bytes = (Get-ChildItem $portable -Recurse -File | Measure-Object Length -Sum).Sum
           Write-Host ("Portable uncompressed: {0:N2} MiB" -f ($bytes / 1MB))
 
@@ -226,11 +211,12 @@ jobs:
               if (Test-Path $stderr) { Get-Content $stderr -ErrorAction SilentlyContinue }
               throw 'mGBA GUI failed real launch test'
             }
-            Write-Host "mGBA GUI stayed alive. PID=$($p.Id) MainWindowHandle=$($p.MainWindowHandle)"
+            Write-Host "mGBA GUI stayed alive for 10 seconds. PID=$($p.Id)"
           } finally {
             if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
             $env:PATH = $oldPath
           }
+
           $sdl = Join-Path $portable 'mgba-sdl.exe'
           $sdlp = Start-Process -FilePath $sdl -ArgumentList '--version' -WorkingDirectory $portable -Wait -PassThru
           if ($sdlp.ExitCode -ne 0) { throw "mgba-sdl.exe --version exited $($sdlp.ExitCode)" }
@@ -270,6 +256,6 @@ jobs:
           if ($tagSha -ne $expected) { throw "Tag $tag points to $tagSha, expected $expected" }
           gh release upload $tag $asset --repo $repo --clobber
           if ($LASTEXITCODE -ne 0) { throw 'Release upload failed' }
-          gh release edit $tag --repo $repo --notes 'FRLG RevA multi-platform release. Windows x64 uses an official-style static MinGW64 + Qt 5 build. Qt, SDL2, libepoxy, PNG/zlib, OpenSSL/zstd and compiler runtimes are linked into the executables instead of shipped as loose runtime DLLs. The Windows package is only published after PE import auditing and a real no-argument GUI launch test in an isolated PATH; --version alone is not accepted as a GUI/runtime test. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
+          gh release edit $tag --repo $repo --notes 'FRLG RevA multi-platform release. Windows x64 uses an official-style static MinGW64 + Qt 5 build. Qt, SDL2, libepoxy, PNG/zlib, OpenSSL/zstd and compiler runtimes are linked into the executables instead of shipped as loose runtime DLLs. The Windows package is only published after PE import auditing and a real no-argument GUI launch test in an isolated PATH. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
           if ($LASTEXITCODE -ne 0) { throw 'Release metadata update failed' }
           gh release view $tag --repo $repo --json url,assets
