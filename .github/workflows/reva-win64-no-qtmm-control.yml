@@ -44,8 +44,23 @@ jobs:
         run: |
           set -euo pipefail
           export PATH="/mingw64/qt5-static/bin:/mingw64/bin:$PATH"
+
+          # mGBA imports QJpegPlugin whenever QT_STATIC is set, but upstream only
+          # adds the QJpegPlugin target inside its QtMultimedia block.  For this
+          # A/B control, keep JPEG support while disabling only QtMultimedia.
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/platform/qt/CMakeLists.txt')
+          s = p.read_text(encoding='utf-8')
+          needle = '''if(QT_TYPE STREQUAL STATIC_LIBRARY)\n\tset(QT_STATIC ON)\n\tlist(APPEND QT_DEFINES QT_STATIC)\nendif()\n'''
+          repl = needle + '''\nif(WIN32 AND QT_STATIC AND TARGET ${QT}::QJpegPlugin)\n\tlist(APPEND QT_LIBRARIES ${QT}::QJpegPlugin)\nendif()\n'''
+          if needle not in s:
+              raise SystemExit('static Qt block not found')
+          p.write_text(s.replace(needle, repl, 1), encoding='utf-8')
+          PY
+
           mkdir -p /mingw64/lib/.reva-hidden-import-libs
-          for name in ssl crypto zstd z; do
+          for name in png16 ssl crypto zstd z SDL2 epoxy; do
             imp="/mingw64/lib/lib${name}.dll.a"
             [[ -f "$imp" ]] && mv "$imp" /mingw64/lib/.reva-hidden-import-libs/
           done
@@ -89,7 +104,6 @@ jobs:
             -DUSE_JSON_C=OFF \
             -DUSE_DISCORD_RPC=OFF
 
-          grep -A30 '^-- Frontends:' /dev/null 2>/dev/null || true
           if grep -q 'Qt5Multimedia' build-control/build.ninja; then
             echo 'Qt5Multimedia unexpectedly remains in the build graph' >&2
             exit 1
