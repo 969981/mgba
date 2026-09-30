@@ -1,0 +1,201 @@
+name: Build FRLG RevA official-style static Windows x64
+
+on:
+  push:
+    branches:
+      - revA-bootstrap
+    paths:
+      - .github/workflows/reva-win64-static.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: reva-win64-static-mingw
+  cancel-in-progress: true
+
+jobs:
+  build-release:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout exact RevA source
+        uses: actions/checkout@v4
+        with:
+          ref: revA
+          fetch-depth: 0
+
+      - name: Verify RevA source commit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = 'fadbf93a565a5bd0b3e7f12b848fc208064a94f1'
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $expected) { throw "revA moved: $actual, expected $expected" }
+          git log --oneline --decorate -3
+
+      - name: Set up MSYS2 MinGW64 static toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            make
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-qt5-static
+            mingw-w64-x86_64-SDL2
+            mingw-w64-x86_64-libepoxy
+            mingw-w64-x86_64-libpng
+            mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-openssl
+
+      - name: Configure static MinGW64 distribution build
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          export PATH="/mingw64/qt5-static/bin:/mingw64/bin:$PATH"
+          cmake -S . -B build-static -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH=/mingw64/qt5-static \
+            -DQt5_DIR=/mingw64/qt5-static/lib/cmake/Qt5 \
+            -DFORCE_QT_VERSION=5 \
+            -DCMAKE_FIND_LIBRARY_SUFFIXES=.a \
+            -DCMAKE_EXE_LINKER_FLAGS='-static -static-libgcc -static-libstdc++' \
+            -DDISTBUILD=ON \
+            -DBUILD_STATIC=ON \
+            -DBUILD_SHARED=OFF \
+            -DBUILD_LTO=ON \
+            -DBUILD_QT=ON \
+            -DBUILD_SDL=ON \
+            -DBUILD_GL=ON \
+            -DBUILD_GLES2=OFF \
+            -DBUILD_GLES3=OFF \
+            -DUSE_EPOXY=ON \
+            -DUSE_ZLIB=ON \
+            -DUSE_PNG=ON \
+            -DUSE_MINIZIP=OFF \
+            -DUSE_FFMPEG=OFF \
+            -DUSE_LIBZIP=OFF \
+            -DUSE_LZMA=OFF \
+            -DUSE_ELF=OFF \
+            -DUSE_LUA=OFF \
+            -DUSE_SQLITE3=OFF \
+            -DUSE_JSON_C=OFF \
+            -DUSE_DISCORD_RPC=OFF
+
+      - name: Build static Windows targets
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          export PATH="/mingw64/qt5-static/bin:/mingw64/bin:$PATH"
+          cmake --build build-static --target mgba-qt mgba-sdl --parallel 2
+          test -f build-static/mGBA.exe
+          test -f build-static/mgba-sdl.exe
+          ls -lh build-static/mGBA.exe build-static/mgba-sdl.exe
+
+      - name: Audit executable imports
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          bad=0
+          for exe in build-static/mGBA.exe build-static/mgba-sdl.exe; do
+            echo "==== $exe imports ===="
+            imports=$(objdump -p "$exe" | awk '/DLL Name:/ {print $3}')
+            printf '%s\n' "$imports"
+            if printf '%s\n' "$imports" | grep -Eqi '(^|/)(Qt[56]|SDL2|libepoxy|libpng|zlib|zlib1|libgcc|libstdc\+\+|libwinpthread|libcrypto|libssl).*\.dll$'; then
+              echo "Unexpected non-system runtime dependency in $exe"
+              bad=1
+            fi
+          done
+          test "$bad" -eq 0
+
+      - name: Assemble official-style portable directory
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $portable = Join-Path $PWD 'portable-static'
+          Remove-Item $portable -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $portable | Out-Null
+
+          Copy-Item 'build-static\mGBA.exe' (Join-Path $portable 'mGBA.exe')
+          Copy-Item 'build-static\mgba-sdl.exe' (Join-Path $portable 'mgba-sdl.exe')
+          Copy-Item 'LICENSE' (Join-Path $portable 'LICENSE.txt')
+          Copy-Item 'CHANGES' (Join-Path $portable 'CHANGES.txt')
+          Copy-Item 'res\nointro.dat' (Join-Path $portable 'nointro.dat')
+          New-Item -ItemType File -Path (Join-Path $portable 'portable.ini') -Force | Out-Null
+
+          if (Test-Path 'res\shaders') {
+            Copy-Item 'res\shaders' (Join-Path $portable 'shaders') -Recurse
+          }
+
+          $dlls = Get-ChildItem $portable -Recurse -Filter '*.dll' -File
+          if ($dlls) {
+            $dlls | Select-Object FullName,Length | Format-Table -AutoSize
+            throw 'Static package unexpectedly contains DLL files'
+          }
+
+          Write-Host 'Official-style static package contents:'
+          Get-ChildItem $portable -Recurse | Select-Object FullName,Length | Format-Table -AutoSize
+          $bytes = (Get-ChildItem $portable -Recurse -File | Measure-Object Length -Sum).Sum
+          Write-Host ("Portable uncompressed: {0:N2} MiB" -f ($bytes / 1MB))
+
+      - name: Smoke-test isolated static package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $portable = Join-Path $PWD 'portable-static'
+          function Test-Exe([string]$name) {
+            $exe = Join-Path $portable $name
+            $oldPath = $env:PATH
+            try {
+              $env:PATH = "$portable;C:\Windows\System32;C:\Windows"
+              $p = Start-Process -FilePath $exe -ArgumentList '--version' -WorkingDirectory $portable -Wait -PassThru
+              if ($p.ExitCode -ne 0) { throw "$name --version exited $($p.ExitCode)" }
+            } finally {
+              $env:PATH = $oldPath
+            }
+          }
+          Test-Exe 'mgba-sdl.exe'
+          Test-Exe 'mGBA.exe'
+
+      - name: Create solid 7z package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $asset = Join-Path $PWD 'mGBA-FRLG-RevA-win64.7z'
+          Remove-Item $asset -Force -ErrorAction SilentlyContinue
+          & 7z a -t7z -mx=9 -m0=lzma2:d=64m:fb=273 -ms=on -mmt=on $asset '.\portable-static\*'
+          if ($LASTEXITCODE -ne 0) { throw '7z packaging failed' }
+          $item = Get-Item $asset
+          $hash = Get-FileHash $asset -Algorithm SHA256
+          Write-Host ("7z size: {0:N2} MiB" -f ($item.Length / 1MB))
+          $item | Select-Object Name,Length | Format-Table -AutoSize
+          $hash | Format-Table -AutoSize
+
+      - name: Upload verified static artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mGBA-FRLG-RevA-win64-static
+          path: mGBA-FRLG-RevA-win64.7z
+          if-no-files-found: error
+
+      - name: Publish static package to RevA release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo = '969981/mgba'
+          $tag = 'revA-20260930'
+          $expected = 'fadbf93a565a5bd0b3e7f12b848fc208064a94f1'
+          $asset = '.\mGBA-FRLG-RevA-win64.7z'
+          $tagSha = (gh api "repos/$repo/git/ref/tags/$tag" --jq '.object.sha').Trim()
+          if ($tagSha -ne $expected) { throw "Tag $tag points to $tagSha, expected $expected" }
+          gh release upload $tag $asset --repo $repo --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Release upload failed' }
+          gh release edit $tag --repo $repo --notes 'FRLG RevA multi-platform release. Windows x64 now uses an official-style fully static MinGW64 + Qt 5 static build: Qt platform/style/image plugins, SDL2, libepoxy, libpng and compiler runtimes are linked into the executables instead of shipped as loose DLLs. The portable payload keeps only the executables, core data/documentation and shader resources. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
+          if ($LASTEXITCODE -ne 0) { throw 'Release metadata update failed' }
+          gh release view $tag --repo $repo --json url,assets
