@@ -82,13 +82,16 @@ jobs:
             -DUSE_DISCORD_RPC=OFF
           if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
 
-      - name: Build Release
+      - name: Build portable Release targets
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          cmake --build build-release --parallel 2
-          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
-          Get-ChildItem build-release -Recurse -Filter *.exe | Select-Object FullName,Length | Format-Table -AutoSize
+          cmake --build build-release --target mgba-qt mgba-sdl --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw 'Portable target build failed' }
+          foreach ($exe in @('build-release\mGBA.exe','build-release\mgba-sdl.exe')) {
+            if (-not (Test-Path $exe)) { throw "Expected executable missing: $exe" }
+          }
+          Get-Item build-release\mGBA.exe,build-release\mgba-sdl.exe | Select-Object FullName,Length | Format-Table -AutoSize
 
       - name: Assemble minimal portable directory
         shell: pwsh
