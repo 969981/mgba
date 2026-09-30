@@ -1,5 +1,5 @@
-# RevA Windows static release pipeline v5: UCRT64 + restored SQLite3 + real GUI launch gate
-name: Build and publish FRLG RevA static Windows x64
+# RevA Windows release pipeline v6: official mGBA windows:w64 Docker toolchain
+name: Build and publish FRLG RevA official Windows x64
 
 on:
   push:
@@ -13,16 +13,19 @@ permissions:
   contents: write
 
 concurrency:
-  group: reva-win64-static-ucrt64
+  group: reva-win64-official-docker
   cancel-in-progress: true
 
 env:
   RELEASE_TAG: revA-20260930
   EXPECTED_REVA: fadbf93a565a5bd0b3e7f12b848fc208064a94f1
+  OFFICIAL_IMAGE: mgba/windows:w64
+  BUILD_DIR: build-win64-official
+  ASSET_NAME: mGBA-FRLG-RevA-win64.7z
 
 jobs:
-  build-release:
-    runs-on: windows-2022
+  build:
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout exact RevA source
         uses: actions/checkout@v4
@@ -30,200 +33,176 @@ jobs:
           ref: fadbf93a565a5bd0b3e7f12b848fc208064a94f1
           fetch-depth: 0
 
-      - name: Verify RevA source commit
-        shell: pwsh
+      - name: Verify exact RevA source
+        shell: bash
         run: |
-          $ErrorActionPreference = 'Stop'
-          $actual = (git rev-parse HEAD).Trim()
-          if ($actual -ne $env:EXPECTED_REVA) { throw "RevA source mismatch: $actual" }
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          test "$actual" = "$EXPECTED_REVA"
+          test -z "$(git status --porcelain)"
           git log --oneline --decorate -3
-          if ((git status --porcelain)) { throw 'RevA checkout is unexpectedly dirty before build' }
 
-      - name: Set up UCRT64 static toolchain
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: UCRT64
-          update: true
-          install: >-
-            mingw-w64-ucrt-x86_64-toolchain
-            mingw-w64-ucrt-x86_64-cmake
-            mingw-w64-ucrt-x86_64-ninja
-            mingw-w64-ucrt-x86_64-qt5-static
-            mingw-w64-ucrt-x86_64-SDL2
-            mingw-w64-ucrt-x86_64-libepoxy
-            mingw-w64-ucrt-x86_64-libpng
-            mingw-w64-ucrt-x86_64-zlib
-            mingw-w64-ucrt-x86_64-zstd
-            mingw-w64-ucrt-x86_64-openssl
-            mingw-w64-ucrt-x86_64-sqlite3
-
-      - name: Configure static UCRT64 distribution build
-        shell: msys2 {0}
+      - name: Pull official mGBA Windows x64 image
+        shell: bash
         run: |
           set -euo pipefail
-          export PATH="/ucrt64/qt5-static/bin:/ucrt64/bin:$PATH"
+          docker pull "$OFFICIAL_IMAGE"
+          docker inspect "$OFFICIAL_IMAGE" --format='{{index .RepoDigests 0}}'
 
-          QTSTATIC_LIB=/ucrt64/qt5-static/lib
-          QTPNG="$QTSTATIC_LIB/libqtlibpng.a"
-          ZLIB_STATIC=/ucrt64/lib/libz.a
-          SDL2_STATIC=/ucrt64/lib/libSDL2.a
-          SDL2MAIN_STATIC=/ucrt64/lib/libSDL2main.a
-          EPOXY_STATIC=/ucrt64/lib/libepoxy.a
-          SQLITE_STATIC=/ucrt64/lib/libsqlite3.a
-
-          for lib in "$QTPNG" "$ZLIB_STATIC" "$SDL2_STATIC" "$SDL2MAIN_STATIC" "$EPOXY_STATIC" "$SQLITE_STATIC"; do
-            test -f "$lib" || { echo "Required static library missing: $lib" >&2; exit 1; }
-            ls -lh "$lib"
-          done
-
-          # Keep direct runtimes static. Restoring SQLite3 also restores the
-          # normal Window startup path that attaches a central widget before
-          # Window::setLogo() runs; do not mutate RevA source during packaging.
-          HIDDEN=/ucrt64/lib/.reva-hidden-import-libs
-          mkdir -p "$HIDDEN"
-          for name in png16 ssl crypto zstd z SDL2 epoxy sqlite3; do
-            imp="/ucrt64/lib/lib${name}.dll.a"
-            if [[ -f "$imp" ]]; then
-              echo "Hiding DLL import library: $imp"
-              mv "$imp" "$HIDDEN/"
-            fi
-          done
-
-          cmake -S . -B build-static -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_PREFIX_PATH=/ucrt64/qt5-static \
-            -DQt5_DIR=/ucrt64/qt5-static/lib/cmake/Qt5 \
-            -DFORCE_QT_VERSION=5 \
-            -DCMAKE_EXE_LINKER_FLAGS='-static -static-libgcc -static-libstdc++' \
-            -DDISTBUILD=ON \
-            -DBUILD_STATIC=ON \
-            -DBUILD_SHARED=OFF \
-            -DBUILD_LTO=ON \
-            -DBUILD_QT=ON \
-            -DBUILD_SDL=ON \
-            -DBUILD_GL=ON \
-            -DBUILD_GLES2=OFF \
-            -DBUILD_GLES3=OFF \
-            -DUSE_EPOXY=ON \
-            -DEPOXY_LIBRARIES="$EPOXY_STATIC" \
-            -DEPOXY_INCLUDE_DIRS=/ucrt64/include \
-            -DUSE_ZLIB=ON \
-            -DZLIB_LIBRARY="$ZLIB_STATIC" \
-            -DZLIB_LIBRARY_RELEASE="$ZLIB_STATIC" \
-            -DZLIB_INCLUDE_DIR=/ucrt64/include \
-            -DUSE_PNG=ON \
-            -DPNG_LIBRARY="$QTPNG" \
-            -DPNG_LIBRARY_RELEASE="$QTPNG" \
-            -DPNG_PNG_INCLUDE_DIR=/ucrt64/include \
-            -DUSE_SQLITE3=ON \
-            -DSQLite3_LIBRARY="$SQLITE_STATIC" \
-            -DSQLite3_INCLUDE_DIR=/ucrt64/include \
-            -DSDL2_LIBRARIES_TEMP="$SDL2_STATIC" \
-            -DSDL2MAIN_LIBRARY="$SDL2MAIN_STATIC" \
-            -DUSE_MINIZIP=OFF \
-            -DUSE_FFMPEG=OFF \
-            -DUSE_LIBZIP=OFF \
-            -DUSE_LZMA=OFF \
-            -DUSE_ELF=OFF \
-            -DUSE_LUA=OFF \
-            -DUSE_JSON_C=OFF \
-            -DUSE_DISCORD_RPC=OFF
-
-          echo '==== SQLite configuration ===='
-          grep -Ei '^(USE_SQLITE3|SQLite3_|SQLITE3_).*=' build-static/CMakeCache.txt || true
-          grep -q '^USE_SQLITE3:BOOL=ON$' build-static/CMakeCache.txt
-
-      - name: Build static Windows targets
-        shell: msys2 {0}
+      - name: Build with official mGBA Windows x64 toolchain
+        shell: bash
         run: |
           set -euo pipefail
-          export PATH="/ucrt64/qt5-static/bin:/ucrt64/bin:$PATH"
-          cmake --build build-static --target mgba-qt mgba-sdl --parallel 2
-          test -f build-static/mGBA.exe
-          test -f build-static/mgba-sdl.exe
-          ls -lh build-static/mGBA.exe build-static/mgba-sdl.exe
+          rm -rf "$BUILD_DIR"
+          mkdir -p "$BUILD_DIR"
+          chmod 777 "$BUILD_DIR"
 
-      - name: Audit executable imports
-        shell: msys2 {0}
+          # Mirrors the official mGBA Buildbot Windows configuration:
+          # mgba/windows:w64, static distribution, Qt+SDL+FFmpeg enabled,
+          # LTO disabled, and the official CMake toolchain supplied by the image.
+          CMAKE_FLAGS='-DDISTBUILD=ON -DCMAKE_BUILD_TYPE=Release -DCPACK_PACKAGE_FILE_NAME=build -DBUILD_PERF=OFF -DBUILD_SDL=ON -DBUILD_QT=ON -DUSE_FFMPEG=ON -DBUILD_LTO=OFF -DBUILD_STATIC=ON -DBUILD_SHARED=OFF -DM_CORE_DS=ON -DBUILD_PYTHON=OFF -DBUILD_SUITE=OFF -DINSTALLER_NAME=build-installer'
+
+          docker run --rm \
+            -e "BUILD_DIR=$BUILD_DIR" \
+            -e "CMAKE_FLAGS=$CMAKE_FLAGS" \
+            -e MAKEFLAGS=-j3 \
+            -v "$PWD:/home/mgba/src" \
+            "$OFFICIAL_IMAGE"
+
+          sudo chown -R "$(id -u):$(id -g)" "$BUILD_DIR"
+          test -f "$BUILD_DIR/mGBA.exe"
+          test -f "$BUILD_DIR/mgba-sdl.exe"
+          ls -lh "$BUILD_DIR/mGBA.exe" "$BUILD_DIR/mgba-sdl.exe"
+
+      - name: Generate official CPack components
+        shell: bash
         run: |
           set -euo pipefail
-          bad=0
-          for exe in build-static/mGBA.exe build-static/mgba-sdl.exe; do
-            echo "==== $exe imports ===="
-            imports=$(objdump -p "$exe" | awk '/DLL Name:/ {print $3}')
-            printf '%s\n' "$imports"
-            if printf '%s\n' "$imports" | grep -Eqi '(^|/)(Qt[56]|SDL2|libepoxy|libpng|zlib|zlib1|libzstd|libgcc|libstdc\+\+|libwinpthread|libcrypto|libssl|sqlite3).*\.dll$'; then
-              echo "Unexpected non-system runtime dependency in $exe"
-              bad=1
-            fi
+          docker run --rm \
+            -w "/home/mgba/src/$BUILD_DIR" \
+            -v "$PWD:/home/mgba/src" \
+            "$OFFICIAL_IMAGE" \
+            cpack -V -G TXZ
+
+          sudo chown -R "$(id -u):$(id -g)" "$BUILD_DIR"
+          for archive in build-base.tar.xz build-sdl.tar.xz build-qt.tar.xz; do
+            test -f "$BUILD_DIR/$archive" || {
+              echo "Expected official CPack component missing: $archive" >&2
+              find "$BUILD_DIR" -maxdepth 2 -type f -printf '%p\n' | sort
+              exit 1
+            }
+            ls -lh "$BUILD_DIR/$archive"
           done
-          test "$bad" -eq 0
 
-      - name: Assemble portable directory
-        shell: pwsh
+      - name: Assemble official release tree
+        shell: bash
         run: |
-          $ErrorActionPreference = 'Stop'
-          $portable = Join-Path $PWD 'portable-static'
-          Remove-Item $portable -Recurse -Force -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Path $portable | Out-Null
+          set -euo pipefail
+          rm -rf package-official
+          mkdir package-official
 
-          Copy-Item 'build-static\mGBA.exe' (Join-Path $portable 'mGBA.exe')
-          Copy-Item 'build-static\mgba-sdl.exe' (Join-Path $portable 'mgba-sdl.exe')
-          Copy-Item 'LICENSE' (Join-Path $portable 'LICENSE.txt')
-          Copy-Item 'CHANGES' (Join-Path $portable 'CHANGES.txt')
-          Copy-Item 'res\nointro.dat' (Join-Path $portable 'nointro.dat')
-          New-Item -ItemType File -Path (Join-Path $portable 'portable.ini') -Force | Out-Null
-          if (Test-Path 'res\shaders') { Copy-Item 'res\shaders' (Join-Path $portable 'shaders') -Recurse }
-          if (Test-Path 'res\scripts') { Copy-Item 'res\scripts' (Join-Path $portable 'scripts') -Recurse }
+          for archive in build-base.tar.xz build-sdl.tar.xz build-qt.tar.xz; do
+            tar -xJf "$BUILD_DIR/$archive" -C package-official
+          done
 
-          $dlls = Get-ChildItem $portable -Recurse -Filter '*.dll' -File
-          if ($dlls) { throw 'Static package unexpectedly contains DLL files' }
+          qt_exe="$(find package-official -type f -iname 'mGBA.exe' -print -quit)"
+          sdl_exe="$(find package-official -type f -iname 'mgba-sdl.exe' -print -quit)"
+          test -n "$qt_exe"
+          test -n "$sdl_exe"
 
-      - name: Real-launch test static GUI
-        shell: pwsh
+          echo "Qt frontend:  $qt_exe"
+          echo "SDL frontend: $sdl_exe"
+          echo '==== Official release tree ===='
+          find package-official -maxdepth 3 -type f -printf '%10s  %p\n' | sort -nr | head -100
+
+      - name: Create official-style 7z
+        shell: bash
         run: |
-          $ErrorActionPreference = 'Stop'
-          $portable = Join-Path $PWD 'portable-static'
-          $exe = Join-Path $portable 'mGBA.exe'
-          $oldPath = $env:PATH
-          $p = $null
-          try {
-            $env:PATH = "$portable;$env:WINDIR\System32;$env:WINDIR"
-            $p = Start-Process -FilePath $exe -WorkingDirectory $portable -PassThru
-            Start-Sleep -Seconds 10
-            $p.Refresh()
-            if ($p.HasExited) { throw "mGBA GUI exited early with code $($p.ExitCode)" }
-            if ($p.MainWindowHandle -eq 0) { throw 'mGBA process is alive but no GUI window handle was created' }
-            Write-Host "GUI launch gate passed. PID=$($p.Id) MainWindowHandle=$($p.MainWindowHandle)"
-          } finally {
-            if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
-            $env:PATH = $oldPath
-          }
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq p7zip-full
+          rm -f "$ASSET_NAME"
 
-          $sdl = Join-Path $portable 'mgba-sdl.exe'
-          $sdlp = Start-Process -FilePath $sdl -ArgumentList '--version' -WorkingDirectory $portable -Wait -PassThru
-          if ($sdlp.ExitCode -ne 0) { throw "mgba-sdl.exe --version exited $($sdlp.ExitCode)" }
+          # Same 7z method used by mGBA's Buildbot packaging.
+          (
+            cd package-official
+            7z a -t7z -m0=lzma -mx=9 -mfb=64 -md=32m -ms=on "../$ASSET_NAME" .
+          )
 
-      - name: Create verified 7z package
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $asset = Join-Path $PWD 'mGBA-FRLG-RevA-win64.7z'
-          Remove-Item $asset -Force -ErrorAction SilentlyContinue
-          & 7z a -t7z -mx=9 -m0=lzma2:d=64m:fb=273 -ms=on -mmt=on $asset '.\portable-static\*'
-          if ($LASTEXITCODE -ne 0) { throw '7z packaging failed' }
-          $hash = Get-FileHash $asset -Algorithm SHA256
-          Get-Item $asset | Select-Object Name,Length | Format-Table -AutoSize
-          $hash | Format-Table -AutoSize
+          ls -lh "$ASSET_NAME"
+          sha256sum "$ASSET_NAME"
 
-      - name: Upload verified artifact
+      - name: Upload official-toolchain artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mGBA-FRLG-RevA-win64-ucrt64
+          name: mGBA-FRLG-RevA-win64-official
           path: mGBA-FRLG-RevA-win64.7z
           if-no-files-found: error
 
-      - name: Publish Windows package to RevA release
+  verify-publish:
+    needs: build
+    runs-on: windows-2022
+    steps:
+      - name: Download official-toolchain artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mGBA-FRLG-RevA-win64-official
+          path: artifact
+
+      - name: Extract package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $asset = Join-Path $PWD "artifact\$env:ASSET_NAME"
+          if (-not (Test-Path $asset)) { throw "Asset missing: $asset" }
+
+          Remove-Item smoke -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path smoke | Out-Null
+          & 7z x $asset '-osmoke' -y
+          if ($LASTEXITCODE -ne 0) { throw '7z extraction failed' }
+
+          Get-ChildItem smoke -Recurse -File |
+            Sort-Object Length -Descending |
+            Select-Object -First 100 Length,FullName |
+            Format-Table -AutoSize
+
+      - name: Real-launch test on Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Get-ChildItem smoke -Recurse -File -Filter 'mGBA.exe' | Select-Object -First 1
+          if (-not $exe) { throw 'mGBA.exe not found in official-toolchain archive' }
+
+          $root = $exe.Directory.FullName
+          $oldPath = $env:PATH
+          $p = $null
+          try {
+            $env:PATH = "$root;$env:WINDIR\System32;$env:WINDIR"
+            $p = Start-Process -FilePath $exe.FullName -WorkingDirectory $root -PassThru
+            Start-Sleep -Seconds 10
+            $p.Refresh()
+
+            if ($p.HasExited) {
+              $code = $p.ExitCode
+              throw ("mGBA GUI exited early: {0} / 0x{1:X8}" -f $code, [uint32]$code)
+            }
+            if ($p.MainWindowHandle -eq 0) {
+              throw 'mGBA process stayed alive but did not create a main window'
+            }
+            Write-Host "GUI launch gate passed: PID=$($p.Id) MainWindowHandle=$($p.MainWindowHandle)"
+          } finally {
+            if ($p -and -not $p.HasExited) {
+              Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            }
+            $env:PATH = $oldPath
+          }
+
+          $sdl = Get-ChildItem smoke -Recurse -File -Filter 'mgba-sdl.exe' | Select-Object -First 1
+          if (-not $sdl) { throw 'mgba-sdl.exe not found in official-toolchain archive' }
+          $sdlp = Start-Process -FilePath $sdl.FullName -ArgumentList '--version' -WorkingDirectory $sdl.Directory.FullName -Wait -PassThru
+          if ($sdlp.ExitCode -ne 0) { throw "mgba-sdl.exe --version exited $($sdlp.ExitCode)" }
+
+      - name: Publish verified Windows package
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -231,11 +210,19 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $repo = '969981/mgba'
           $tag = $env:RELEASE_TAG
-          $asset = '.\mGBA-FRLG-RevA-win64.7z'
+          $asset = Join-Path $PWD "artifact\$env:ASSET_NAME"
+
           $tagSha = (gh api "repos/$repo/git/ref/tags/$tag" --jq '.object.sha').Trim()
-          if ($tagSha -ne $env:EXPECTED_REVA) { throw "Tag $tag points to $tagSha, expected $env:EXPECTED_REVA" }
+          if ($tagSha -ne $env:EXPECTED_REVA) {
+            throw "Tag $tag points to $tagSha, expected $env:EXPECTED_REVA"
+          }
+
           gh release upload $tag $asset --repo $repo --clobber
           if ($LASTEXITCODE -ne 0) { throw 'Release upload failed' }
-          gh release edit $tag --repo $repo --notes 'FRLG RevA multi-platform release. Windows x64 is built from the exact RevA tag with UCRT64 + static Qt 5 and SQLite3 game-library support restored. No source mutation is performed during packaging. The Windows asset is only published after PE import auditing and a real no-argument GUI launch that produces a window. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
+
+          gh release edit $tag --repo $repo --notes 'FRLG RevA multi-platform release. Windows x64 is built from the exact RevA commit with the official mGBA mgba/windows:w64 Docker toolchain and the same Windows Buildbot distribution flags: static build, Qt/SDL/FFmpeg enabled, LTO disabled, and official CPack base/SDL/Qt components merged before 7z packaging. The Windows asset is published only after the resulting archive is extracted and the GUI is actually launched on a clean Windows Server runner. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
           if ($LASTEXITCODE -ne 0) { throw 'Release metadata update failed' }
+
+          Get-FileHash $asset -Algorithm SHA256 | Format-Table -AutoSize
+          Get-Item $asset | Select-Object Name,Length | Format-Table -AutoSize
           gh release view $tag --repo $repo --json url,assets
