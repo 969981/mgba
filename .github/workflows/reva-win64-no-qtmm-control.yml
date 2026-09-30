@@ -1,0 +1,129 @@
+name: Control RevA static Windows without QtMultimedia
+
+on:
+  push:
+    branches:
+      - revA-bootstrap
+    paths:
+      - .github/workflows/reva-win64-no-qtmm-control.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  no-qtmm-control:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout RevA
+        uses: actions/checkout@v4
+        with:
+          ref: fadbf93a565a5bd0b3e7f12b848fc208064a94f1
+          fetch-depth: 0
+
+      - name: Set up static MinGW64 toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          suppress-deprecation-warnings: msystem-mingw64
+          install: >-
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-qt5-static
+            mingw-w64-x86_64-SDL2
+            mingw-w64-x86_64-libepoxy
+            mingw-w64-x86_64-libpng
+            mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-zstd
+            mingw-w64-x86_64-openssl
+
+      - name: Configure static build with SDL audio only
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          export PATH="/mingw64/qt5-static/bin:/mingw64/bin:$PATH"
+          mkdir -p /mingw64/lib/.reva-hidden-import-libs
+          for name in ssl crypto zstd z; do
+            imp="/mingw64/lib/lib${name}.dll.a"
+            [[ -f "$imp" ]] && mv "$imp" /mingw64/lib/.reva-hidden-import-libs/
+          done
+
+          cmake -S . -B build-control -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH=/mingw64/qt5-static \
+            -DQt5_DIR=/mingw64/qt5-static/lib/cmake/Qt5 \
+            -DFORCE_QT_VERSION=5 \
+            -DCMAKE_DISABLE_FIND_PACKAGE_Qt5Multimedia=TRUE \
+            -DCMAKE_EXE_LINKER_FLAGS='-static -static-libgcc -static-libstdc++' \
+            -DDISTBUILD=ON \
+            -DBUILD_STATIC=ON \
+            -DBUILD_SHARED=OFF \
+            -DBUILD_LTO=ON \
+            -DBUILD_QT=ON \
+            -DBUILD_SDL=ON \
+            -DBUILD_GL=ON \
+            -DBUILD_GLES2=OFF \
+            -DBUILD_GLES3=OFF \
+            -DUSE_EPOXY=ON \
+            -DEPOXY_LIBRARIES=/mingw64/lib/libepoxy.a \
+            -DEPOXY_INCLUDE_DIRS=/mingw64/include \
+            -DUSE_ZLIB=ON \
+            -DZLIB_LIBRARY=/mingw64/lib/libz.a \
+            -DZLIB_LIBRARY_RELEASE=/mingw64/lib/libz.a \
+            -DZLIB_INCLUDE_DIR=/mingw64/include \
+            -DUSE_PNG=ON \
+            -DPNG_LIBRARY=/mingw64/qt5-static/lib/libqtlibpng.a \
+            -DPNG_LIBRARY_RELEASE=/mingw64/qt5-static/lib/libqtlibpng.a \
+            -DPNG_PNG_INCLUDE_DIR=/mingw64/include \
+            -DSDL2_LIBRARIES_TEMP=/mingw64/lib/libSDL2.a \
+            -DSDL2MAIN_LIBRARY=/mingw64/lib/libSDL2main.a \
+            -DUSE_MINIZIP=OFF \
+            -DUSE_FFMPEG=OFF \
+            -DUSE_LIBZIP=OFF \
+            -DUSE_LZMA=OFF \
+            -DUSE_ELF=OFF \
+            -DUSE_LUA=OFF \
+            -DUSE_SQLITE3=OFF \
+            -DUSE_JSON_C=OFF \
+            -DUSE_DISCORD_RPC=OFF
+
+          grep -A30 '^-- Frontends:' /dev/null 2>/dev/null || true
+          if grep -q 'Qt5Multimedia' build-control/build.ninja; then
+            echo 'Qt5Multimedia unexpectedly remains in the build graph' >&2
+            exit 1
+          fi
+
+      - name: Build and audit
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          export PATH="/mingw64/qt5-static/bin:/mingw64/bin:$PATH"
+          cmake --build build-control --target mgba-qt --parallel 2
+          ls -lh build-control/mGBA.exe
+          objdump -p build-control/mGBA.exe | awk '/DLL Name:/ {print $3}' | tee imports.txt
+          if grep -Eqi '(Qt[56]|SDL2|libepoxy|libpng|zlib|libzstd|libgcc|libstdc\+\+|libwinpthread|libcrypto|libssl).*\.dll$' imports.txt; then
+            echo 'Non-system DLL import remains' >&2
+            exit 1
+          fi
+
+      - name: Real-launch GUI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = (Resolve-Path 'build-control\mGBA.exe').Path
+          $root = Split-Path $exe -Parent
+          $oldPath = $env:PATH
+          $p = $null
+          try {
+            $env:PATH = "$root;$env:WINDIR\System32;$env:WINDIR"
+            $p = Start-Process -FilePath $exe -WorkingDirectory $root -PassThru
+            Start-Sleep -Seconds 10
+            $p.Refresh()
+            if ($p.HasExited) { throw "NO-QTMM FAIL: exited code $($p.ExitCode)" }
+            Write-Host "NO-QTMM PASS: alive after 10s; PID=$($p.Id); MainWindowHandle=$($p.MainWindowHandle)"
+          } finally {
+            if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+            $env:PATH = $oldPath
+          }
