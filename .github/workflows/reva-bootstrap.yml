@@ -45,20 +45,14 @@ jobs:
             unzip
             p7zip
             mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-ffmpeg
             mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-gdb
-            mingw-w64-x86_64-libelf
             mingw-w64-x86_64-libepoxy
-            mingw-w64-x86_64-libzip
-            mingw-w64-x86_64-lua
             mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-angleproject
             mingw-w64-x86_64-qt5
             mingw-w64-x86_64-SDL2
             mingw-w64-x86_64-ntldd-git
 
-      - name: Configure release build
+      - name: Configure compact release build
         shell: msys2 {0}
         run: |
           set -euxo pipefail
@@ -66,7 +60,17 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DDISTBUILD=ON \
             -DBUILD_STATIC=ON \
-            -DBUILD_SHARED=OFF
+            -DBUILD_SHARED=OFF \
+            -DBUILD_LTO=ON \
+            -DUSE_FFMPEG=OFF \
+            -DUSE_LIBZIP=OFF \
+            -DUSE_MINIZIP=OFF \
+            -DUSE_LZMA=OFF \
+            -DUSE_ELF=OFF \
+            -DUSE_LUA=OFF \
+            -DUSE_SQLITE3=OFF \
+            -DUSE_JSON_C=OFF \
+            -DUSE_DISCORD_RPC=OFF
 
       - name: Build mGBA
         shell: msys2 {0}
@@ -136,7 +140,8 @@ jobs:
           echo "Portable files: $(find portable -type f | wc -l)"
           echo "Portable DLLs: $(find portable -type f -iname '*.dll' | wc -l)"
           du -sh portable
-          find portable -maxdepth 2 -type f -printf '%P\n' | sort
+          echo 'Largest packaged files:'
+          find portable -type f -printf '%s %P\n' | sort -nr | head -40
 
       - name: Smoke-test compact package
         shell: pwsh
@@ -200,7 +205,7 @@ jobs:
           $expected = 'fadbf93a565a5bd0b3e7f12b848fc208064a94f1'
           $assets = @('.\mGBA-FRLG-RevA-Windows-x64.zip','.\mGBA-FRLG-RevA-win64.7z')
           $title = 'mGBA FRLG RevA (2026-09-30)'
-          $notes = 'FRLG RevA build based on 969981/mgba master c3c8e5e with the RevA commits rebased on top as c809ee643 and fadbf93a5. Windows x64 packaging merges upstream CPack base/Qt/SDL components, copies only direct MinGW runtime dependencies reported by ntldd -R, and lets windeployqt add the required Qt runtime/plugins. The mGBA core is static, symbols are stripped, and both ZIP and solid 7z packages are provided. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
+          $notes = 'FRLG RevA build based on 969981/mgba master c3c8e5e with the RevA commits rebased on top as c809ee643 and fadbf93a5. Windows x64 uses the normal Qt GUI and SDL frontend, static mGBA core, LTO, bundled minizip and stripped runtime files. FFmpeg video recording/encoding is disabled to avoid bundling the very large modern codec dependency tree; normal emulation, saves, debugging and GUI use remain. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
 
           $tagSha = gh api "repos/$repo/git/ref/tags/$tag" --jq '.object.sha' 2>$null
           if ($LASTEXITCODE -eq 0) {
