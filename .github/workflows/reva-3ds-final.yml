@@ -1,0 +1,82 @@
+name: Build FRLG RevA 3DS final release
+
+on:
+  push:
+    branches:
+      - revA-bootstrap
+    paths:
+      - .github/workflows/reva-3ds-final.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  REV_SHA: fadbf93a565a5bd0b3e7f12b848fc208064a94f1
+  RELEASE_TAG: revA-20260930
+
+jobs:
+  n3ds:
+    name: Nintendo 3DS release
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkitarm:latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revA
+          fetch-depth: 0
+      - name: Verify source
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" = "$REV_SHA"
+      - name: Install build tools and build host bannertool
+        shell: bash
+        run: |
+          set -euxo pipefail
+          apt-get update
+          apt-get install -y cmake make g++ git p7zip-full
+          dkp-pacman -Syu --noconfirm
+          dkp-pacman -S --needed --noconfirm 3ds-dev
+
+          git clone --depth 1 https://github.com/carstene1ns/3ds-bannertool.git /tmp/3ds-bannertool
+          cmake -S /tmp/3ds-bannertool -B /tmp/3ds-bannertool/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake --build /tmp/3ds-bannertool/build --parallel 2
+          cmake --install /tmp/3ds-bannertool/build
+          command -v bannertool
+          bannertool --help || true
+      - name: Build 3DS package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S . -B build -G "Unix Makefiles" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDISTBUILD=ON \
+            -DCMAKE_TOOLCHAIN_FILE=src/platform/3ds/CMakeToolchain.txt
+          cmake --build build --parallel 2
+
+          test -f build/3ds/mgba.3dsx
+          test -f build/3ds/mgba.cia
+          rm -rf stage
+          mkdir -p stage/3dsx stage/cia
+          cp build/3ds/mgba.3dsx build/3ds/mgba.smdh build/3ds/mgba.xml stage/3dsx/
+          cp build/3ds/mgba.cia stage/cia/
+          cp LICENSE README.md stage/
+          7z a -t7z -mx=9 -ms=on mGBA-FRLG-RevA-3ds.7z ./stage/*
+          ls -lh mGBA-FRLG-RevA-3ds.7z
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 3ds-release
+          path: mGBA-FRLG-RevA-3ds.7z
+          if-no-files-found: error
+      - name: Publish 3DS asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+          gh release upload "$RELEASE_TAG" mGBA-FRLG-RevA-3ds.7z --repo "$GITHUB_REPOSITORY" --clobber
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json url,tagName,assets
