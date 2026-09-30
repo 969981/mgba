@@ -52,23 +52,45 @@ jobs:
             mingw-w64-i686-qt5
             mingw-w64-i686-SDL2
             mingw-w64-i686-ntldd-git
-      - name: Build and package
+      - name: Build and create upstream components
         shell: msys2 {0}
         run: |
           set -euxo pipefail
           cmake -S . -B build -G "MSYS Makefiles" -DCMAKE_BUILD_TYPE=Release -DDISTBUILD=ON -DBUILD_STATIC=ON -DBUILD_SHARED=OFF
           cmake --build build --parallel 2
           (cd build && cpack -G ZIP)
-          mkdir -p unpack portable
-          unzip -q "$(find build -maxdepth 1 -iname '*.zip' | head -n1)" -d unpack
-          ROOT=$(find unpack -mindepth 1 -maxdepth 1 -type d | head -n1)
-          if [ "$(find unpack -mindepth 1 -maxdepth 1 | wc -l)" -eq 1 ] && [ -n "$ROOT" ]; then cp -a "$ROOT"/. portable/; else cp -a unpack/. portable/; fi
+          ls -lah build/*-base.zip build/*-qt.zip build/*-sdl.zip
+      - name: Assemble compact package
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          rm -rf portable
+          mkdir portable
+          for component in base qt sdl; do
+            pkg=$(find build -maxdepth 1 -type f -iname "*-${component}.zip" | head -n1)
+            test -n "$pkg"
+            unzip -qo "$pkg" -d portable
+          done
           rm -rf portable/include portable/lib portable/share/man
           rm -f portable/libmgba.a portable/libmgba.dll portable/libmgba.dll.a
-          ./tools/deploy-win.sh "$PWD/portable/mGBA.exe" "$PWD/portable" "$PWD"
-          ./tools/deploy-win.sh "$PWD/portable/mgba-sdl.exe" "$PWD/portable" "$PWD"
+          test -f portable/mGBA.exe
+          test -f portable/mgba-sdl.exe
+
+          deploy_mingw_deps() {
+            local binary="$1"
+            local dlls
+            dlls=$(ntldd -R "$binary" | grep -i mingw | cut -d'>' -f2 | sed -e 's/(0x[0-9a-f]\+)//' -e 's/^ \+//' -e 's/ \+$//' -e 's,\\,/,g' || true)
+            if [ -n "$dlls" ]; then cp -vu $dlls portable/; fi
+          }
+          deploy_mingw_deps "$PWD/portable/mGBA.exe"
+          deploy_mingw_deps "$PWD/portable/mgba-sdl.exe"
+          WINDEPLOYQT=$(command -v windeployqt-qt5 || command -v windeployqt || true)
+          test -n "$WINDEPLOYQT"
+          "$WINDEPLOYQT" --no-opengl-sw --no-svg --release --dir "$PWD/portable" "$PWD/portable/mGBA.exe"
           find portable -maxdepth 1 -type f \( -iname '*.exe' -o -iname '*.dll' \) -print0 | xargs -0 -r -n1 sh -c 'strip --strip-unneeded "$1" 2>/dev/null || true' _
+          test -f portable/platforms/qwindows.dll
           7z a -t7z -mx=9 -ms=on mGBA-FRLG-RevA-win32.7z ./portable/*
+          ls -lh mGBA-FRLG-RevA-win32.7z
       - name: Smoke test
         shell: pwsh
         run: |
@@ -106,11 +128,12 @@ jobs:
           set -euxo pipefail
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDISTBUILD=ON -DBUILD_STATIC=ON -DBUILD_SHARED=OFF
           cmake --build build --parallel 2
-          find build -type f -perm -111 -name 'mgba*' -print
-          (cd build && cpack -G TXZ)
-          PKG=$(find build -maxdepth 1 -type f \( -name '*.tar.xz' -o -name '*.txz' \) | head -n1)
-          test -n "$PKG"
-          cp "$PKG" mGBA-FRLG-RevA-linux-x64.tar.xz
+          rm -rf stage
+          cmake --install build --prefix "$PWD/stage"
+          rm -rf stage/include stage/lib stage/share/man
+          find stage -type f -perm -111 -exec strip --strip-unneeded {} \; 2>/dev/null || true
+          tar -C stage -cJf mGBA-FRLG-RevA-linux-x64.tar.xz .
+          ls -lh mGBA-FRLG-RevA-linux-x64.tar.xz
       - uses: actions/upload-artifact@v4
         with:
           name: release-linux-x64
@@ -144,6 +167,7 @@ jobs:
           DMG=$(find build -maxdepth 1 -type f -name '*.dmg' | head -n1)
           test -n "$DMG"
           cp "$DMG" mGBA-FRLG-RevA-macos-x64.dmg
+          ls -lh mGBA-FRLG-RevA-macos-x64.dmg
       - uses: actions/upload-artifact@v4
         with:
           name: release-macos-x64
