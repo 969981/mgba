@@ -9,6 +9,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: reva-win64-compact
+  cancel-in-progress: true
+
 jobs:
   build-release:
     runs-on: windows-latest
@@ -67,34 +71,34 @@ jobs:
         run: |
           set -euxo pipefail
           cmake --build build-release --parallel 2
-          find build-release -type f \( -iname 'mGBA.exe' -o -iname 'mgba-sdl.exe' \) -print
+          test -f build-release/mGBA.exe
+          test -f build-release/mgba-sdl.exe
 
-      - name: Create base package
+      - name: Create upstream CPack components
         shell: msys2 {0}
         run: |
           set -euxo pipefail
           cd build-release
           cpack -G ZIP
-          ls -lah *.zip
+          ls -lah *-base.zip *-qt.zip *-sdl.zip
 
-      - name: Assemble compact portable directory using upstream deploy logic
+      - name: Assemble compact portable directory
         shell: msys2 {0}
         run: |
           set -euxo pipefail
-          rm -rf cpack-extracted portable
-          mkdir -p cpack-extracted portable
+          rm -rf portable
+          mkdir -p portable
 
-          BASE_ZIP=$(find build-release -maxdepth 1 -type f -iname '*.zip' | head -n 1)
+          BASE_ZIP=$(find build-release -maxdepth 1 -type f -iname '*-base.zip' | head -n1)
+          QT_ZIP=$(find build-release -maxdepth 1 -type f -iname '*-qt.zip' | head -n1)
+          SDL_ZIP=$(find build-release -maxdepth 1 -type f -iname '*-sdl.zip' | head -n1)
           test -n "$BASE_ZIP"
-          unzip -q "$BASE_ZIP" -d cpack-extracted
+          test -n "$QT_ZIP"
+          test -n "$SDL_ZIP"
 
-          TOP_COUNT=$(find cpack-extracted -mindepth 1 -maxdepth 1 | wc -l)
-          ROOT=$(find cpack-extracted -mindepth 1 -maxdepth 1 -type d | head -n 1)
-          if [ "$TOP_COUNT" -eq 1 ] && [ -n "$ROOT" ]; then
-            cp -a "$ROOT"/. portable/
-          else
-            cp -a cpack-extracted/. portable/
-          fi
+          unzip -qo "$BASE_ZIP" -d portable
+          unzip -qo "$QT_ZIP" -d portable
+          unzip -qo "$SDL_ZIP" -d portable
 
           rm -rf portable/include portable/lib portable/share/man
           rm -f portable/libmgba.a portable/libmgba.dll portable/libmgba.dll.a
@@ -102,8 +106,21 @@ jobs:
           test -f portable/mgba-sdl.exe
           test ! -f portable/libmgba.dll
 
-          ./tools/deploy-win.sh "$PWD/portable/mGBA.exe" "$PWD/portable" "$PWD"
-          ./tools/deploy-win.sh "$PWD/portable/mgba-sdl.exe" "$PWD/portable" "$PWD"
+          deploy_mingw_deps() {
+            local binary="$1"
+            local dlls
+            dlls=$(ntldd -R "$binary" | grep -i mingw | cut -d'>' -f2 | sed -e 's/(0x[0-9a-f]\+)//' -e 's/^ \+//' -e 's/ \+$//' -e 's,\\,/,g' || true)
+            if [ -n "$dlls" ]; then
+              cp -vu $dlls portable/
+            fi
+          }
+
+          deploy_mingw_deps "$PWD/portable/mGBA.exe"
+          deploy_mingw_deps "$PWD/portable/mgba-sdl.exe"
+
+          WINDEPLOYQT=$(command -v windeployqt-qt5 || command -v windeployqt || true)
+          test -n "$WINDEPLOYQT"
+          "$WINDEPLOYQT" --no-opengl-sw --no-svg --release --dir "$PWD/portable" "$PWD/portable/mGBA.exe"
 
           find portable -maxdepth 1 -type f \( -iname '*.exe' -o -iname '*.dll' \) -print0 | \
             xargs -0 -r -n1 sh -c 'strip --strip-unneeded "$1" 2>/dev/null || true' _
@@ -181,7 +198,7 @@ jobs:
           $expected = 'fadbf93a565a5bd0b3e7f12b848fc208064a94f1'
           $assets = @('.\mGBA-FRLG-RevA-Windows-x64.zip','.\mGBA-FRLG-RevA-win64.7z')
           $title = 'mGBA FRLG RevA (2026-09-30)'
-          $notes = 'FRLG RevA build based on 969981/mgba master c3c8e5e with the RevA commits rebased on top as c809ee643 and fadbf93a5. Windows x64 packaging follows upstream mGBA deploy logic: runtime DLLs are collected with ntldd -R and Qt runtime/plugins with windeployqt. The core is linked statically, symbols are stripped, and both ZIP and solid 7z packages are provided. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
+          $notes = 'FRLG RevA build based on 969981/mgba master c3c8e5e with the RevA commits rebased on top as c809ee643 and fadbf93a5. Windows x64 packaging merges upstream CPack base/Qt/SDL components, copies only direct MinGW runtime dependencies reported by ntldd -R, and lets windeployqt add the required Qt runtime/plugins. The mGBA core is static, symbols are stripped, and both ZIP and solid 7z packages are provided. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
 
           $tagSha = gh api "repos/$repo/git/ref/tags/$tag" --jq '.object.sha' 2>$null
           if ($LASTEXITCODE -eq 0) {
