@@ -112,12 +112,19 @@ jobs:
             if (Test-Path $doc) { Copy-Item $doc (Join-Path $portable ($doc + '.txt')) }
           }
 
+          # Do not use --compiler-runtime here. It drops the entire ~25 MiB
+          # vc_redist.x64.exe installer into a portable archive. We resolve and
+          # copy only the individual VC runtime DLLs actually imported below.
           $windeployqt = (Get-Command windeployqt.exe -ErrorAction Stop).Source
-          & $windeployqt --release --compiler-runtime --no-translations --no-opengl-sw --no-system-d3d-compiler --no-svg $portable\mGBA.exe
+          & $windeployqt --release --no-translations --no-opengl-sw --no-system-d3d-compiler --no-svg $portable\mGBA.exe
           if ($LASTEXITCODE -ne 0) { throw 'windeployqt failed' }
 
           $vcpkgBin = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed\x64-windows-release\bin'
           if (-not (Test-Path $vcpkgBin)) { throw "vcpkg bin not found: $vcpkgBin" }
+          $vcRedistRoot = $env:VCToolsRedistDir
+          if (-not $vcRedistRoot -or -not (Test-Path $vcRedistRoot)) {
+            throw "VCToolsRedistDir is unavailable: $vcRedistRoot"
+          }
 
           function Get-Dependents([string]$binary) {
             $lines = & dumpbin.exe /dependents $binary 2>$null
@@ -126,16 +133,28 @@ jobs:
             }
           }
 
+          function Find-RuntimeDll([string]$name) {
+            $vcpkgCandidate = Join-Path $vcpkgBin $name
+            if (Test-Path $vcpkgCandidate) { return $vcpkgCandidate }
+
+            $vcCandidate = Get-ChildItem $vcRedistRoot -Recurse -File -Filter $name -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match '\\x64\\' -and $_.FullName -match 'Microsoft\.VC\d+\.CRT' } |
+              Select-Object -First 1
+            if ($vcCandidate) { return $vcCandidate.FullName }
+            return $null
+          }
+
           $systemDlls = @(
             'KERNEL32.dll','USER32.dll','GDI32.dll','ADVAPI32.dll','SHELL32.dll','OLE32.dll','OLEAUT32.dll',
             'COMDLG32.dll','COMCTL32.dll','WS2_32.dll','WINMM.dll','IMM32.dll','VERSION.dll','SHLWAPI.dll',
             'DWMAPI.dll','UXTHEME.dll','SETUPAPI.dll','CRYPT32.dll','SECUR32.dll','RPCRT4.dll','IPHLPAPI.dll',
-            'DNSAPI.dll','WINHTTP.dll','WTSAPI32.dll','POWRPROF.dll','USERENV.dll','MSVCRT.dll','NTDLL.dll'
+            'DNSAPI.dll','WINHTTP.dll','WTSAPI32.dll','POWRPROF.dll','USERENV.dll','MSVCRT.dll','UCRTBASE.dll','NTDLL.dll'
           ) | ForEach-Object { $_.ToLowerInvariant() }
 
           $queue = [System.Collections.Generic.Queue[string]]::new()
           Get-ChildItem $portable -Recurse -File | Where-Object { $_.Extension -in '.exe','.dll' } | ForEach-Object { $queue.Enqueue($_.FullName) }
           $scanned = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+          $unresolved = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 
           while ($queue.Count -gt 0) {
             $binary = $queue.Dequeue()
@@ -143,17 +162,34 @@ jobs:
             foreach ($dep in (Get-Dependents $binary)) {
               $lower = $dep.ToLowerInvariant()
               if ($systemDlls -contains $lower -or $lower -match '^api-ms-win-' -or $lower -match '^ext-ms-') { continue }
-              if (Get-ChildItem $portable -Recurse -Filter $dep -ErrorAction SilentlyContinue | Select-Object -First 1) { continue }
-              $src = Join-Path $vcpkgBin $dep
-              if (Test-Path $src) {
+              $existing = Get-ChildItem $portable -Recurse -Filter $dep -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($existing) { continue }
+
+              $src = Find-RuntimeDll $dep
+              if ($src) {
                 $dst = Join-Path $portable $dep
                 Copy-Item $src $dst
                 $queue.Enqueue($dst)
-                Write-Host "Bundled vcpkg runtime: $dep"
+                if ($src.StartsWith($vcpkgBin, [StringComparison]::OrdinalIgnoreCase)) {
+                  Write-Host "Bundled vcpkg runtime: $dep"
+                } else {
+                  Write-Host "Bundled app-local MSVC runtime: $dep"
+                }
+              } else {
+                [void]$unresolved.Add($dep)
               }
             }
           }
 
+          # PE imports that are supplied by Windows/Qt plugin loading can be
+          # absent from the two private runtime roots. Print them for auditing;
+          # the isolated launch test below remains the final runtime gate.
+          if ($unresolved.Count -gt 0) {
+            Write-Host 'Unresolved non-system imports (audit):'
+            $unresolved | Sort-Object | ForEach-Object { Write-Host "  $_" }
+          }
+
+          if (Test-Path (Join-Path $portable 'vc_redist.x64.exe')) { throw 'Full VC redistributable installer must not be packaged' }
           if (Test-Path (Join-Path $portable 'libmgba.dll')) { throw 'libmgba.dll unexpectedly present' }
           if (-not (Test-Path (Join-Path $portable 'platforms\qwindows.dll'))) { throw 'Qt platform plugin missing' }
 
@@ -217,6 +253,6 @@ jobs:
           if ($tagSha -ne $expected) { throw "Tag $tag points to $tagSha, expected $expected" }
           gh release upload $tag $asset --repo $repo --clobber
           if ($LASTEXITCODE -ne 0) { throw 'Release upload failed' }
-          gh release edit $tag --repo $repo --notes 'FRLG RevA multi-platform release. Windows x64 is packaged with an official-style MSVC + vcpkg + Qt MSVC toolchain instead of an MSYS2/MinGW runtime tree. The mGBA core is static and LTO-enabled; FFmpeg, Lua, SQLite, ELF and other nonessential distribution dependencies are disabled for this build. The Windows release publishes a solid 7z package as the primary asset to keep size and file count close to upstream release practice. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
+          gh release edit $tag --repo $repo --notes 'FRLG RevA multi-platform release. Windows x64 is packaged with an official-style MSVC + vcpkg + Qt MSVC toolchain instead of an MSYS2/MinGW runtime tree. The mGBA core is static and LTO-enabled; FFmpeg, Lua, SQLite, ELF and other nonessential distribution dependencies are disabled. The Windows portable archive bundles only the individual MSVC runtime DLLs actually imported by the binaries instead of embedding the full VC redistributable installer. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
           if ($LASTEXITCODE -ne 0) { throw 'Release metadata update failed' }
           gh release view $tag --repo $repo --json url,assets
