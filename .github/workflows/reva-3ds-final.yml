@@ -31,12 +31,12 @@ jobs:
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           test "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" = "$REV_SHA"
-      - name: Install build tools and build host bannertool
+      - name: Install build tools and host 3DS packaging tools
         shell: bash
         run: |
           set -euxo pipefail
           apt-get update
-          apt-get install -y cmake make g++ git p7zip-full
+          apt-get install -y cmake make gcc g++ git p7zip-full
           dkp-pacman -Syu --noconfirm
           dkp-pacman -S --needed --noconfirm 3ds-dev
 
@@ -47,7 +47,13 @@ jobs:
           cmake --build /tmp/3ds-bannertool/build --parallel 2
           cmake --install /tmp/3ds-bannertool/build
           command -v bannertool
-          bannertool --help || true
+
+          git clone --depth 1 https://github.com/3DSGuy/Project_CTR.git /tmp/Project_CTR
+          make -C /tmp/Project_CTR/makerom deps -j2
+          make -C /tmp/Project_CTR/makerom program -j2
+          install -m 0755 /tmp/Project_CTR/makerom/bin/makerom /usr/local/bin/makerom
+          command -v makerom
+          makerom -h || true
       - name: Build 3DS package
         shell: bash
         run: |
@@ -73,6 +79,7 @@ jobs:
           path: mGBA-FRLG-RevA-3ds.7z
           if-no-files-found: error
       - name: Publish 3DS asset
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
