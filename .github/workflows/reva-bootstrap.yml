@@ -116,50 +116,64 @@ jobs:
           "$WINDEPLOYQT" --no-opengl-sw --no-svg --release \
             --dir "$PWD/portable" "$PWD/portable/mGBA.exe"
 
-          # windeployqt handles Qt itself and its plugins. Collect every other
-          # MinGW runtime dependency recursively from each PE import table.
-          changed=1
-          while [ "$changed" -eq 1 ]; do
-            changed=0
-            while IFS= read -r bin; do
-              while IFS= read -r dep; do
-                dep=$(printf '%s' "$dep" | tr -d '\r')
-                [ -n "$dep" ] || continue
+          # Build a case-insensitive DLL index once, then traverse each PE file
+          # exactly once. New MinGW DLLs are appended to the queue so their own
+          # imports are resolved recursively without repeated full-directory scans.
+          declare -A mingw_dll
+          while IFS= read -r p; do
+            name=$(basename "$p")
+            key=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')
+            mingw_dll["$key"]="$p"
+          done < <(find /mingw64/bin -maxdepth 1 -type f -iname '*.dll' -print)
 
-                existing=$(find portable -type f -iname "$dep" -print -quit)
-                if [ -n "$existing" ]; then
-                  continue
-                fi
+          declare -A present
+          while IFS= read -r p; do
+            name=$(basename "$p")
+            key=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')
+            present["$key"]=1
+          done < <(find portable -type f -iname '*.dll' -print)
 
-                src=$(find /mingw64/bin -maxdepth 1 -type f -iname "$dep" -print -quit)
-                if [ -n "$src" ]; then
-                  echo "Bundling $dep from $src"
-                  cp -f "$src" portable/
-                  changed=1
-                fi
-              done < <(objdump -p "$bin" 2>/dev/null | awk '/DLL Name:/ {print $3}')
-            done < <(find portable -type f \( -iname '*.exe' -o -iname '*.dll' \) -print)
+          mapfile -t queue < <(find portable -type f \( -iname '*.exe' -o -iname '*.dll' \) -print)
+          declare -A scanned
+          idx=0
+          while [ "$idx" -lt "${#queue[@]}" ]; do
+            bin="${queue[$idx]}"
+            idx=$((idx + 1))
+
+            if [[ -n "${scanned[$bin]+x}" ]]; then
+              continue
+            fi
+            scanned["$bin"]=1
+
+            while IFS= read -r dep; do
+              dep=$(printf '%s' "$dep" | tr -d '\r')
+              [ -n "$dep" ] || continue
+              key=$(printf '%s' "$dep" | tr '[:upper:]' '[:lower:]')
+
+              if [[ -n "${present[$key]+x}" ]]; then
+                continue
+              fi
+
+              src="${mingw_dll[$key]-}"
+              if [ -n "$src" ]; then
+                dst="portable/$(basename "$src")"
+                echo "Bundling $dep from $src"
+                cp -f "$src" "$dst"
+                present["$key"]=1
+                queue+=("$dst")
+              fi
+            done < <(objdump -p "$bin" 2>/dev/null | awk '/DLL Name:/ {print $3}')
           done
 
           test -f portable/Qt5Core.dll
           test -f portable/libstdc++-6.dll
           test -f portable/SDL2.dll
           test -f portable/platforms/qwindows.dll
-
-          MISSING=$(
-            {
-              ntldd -R portable/mGBA.exe || true
-              ntldd -R portable/mgba-sdl.exe || true
-            } | grep -i 'not found' || true
-          )
-          if [ -n "$MISSING" ]; then
-            echo "Unresolved runtime dependencies:"
-            echo "$MISSING"
-            exit 1
-          fi
+          test ! -f portable/libmgba.dll
 
           echo "Portable files: $(find portable -type f | wc -l)"
           echo "Portable DLLs: $(find portable -type f -iname '*.dll' | wc -l)"
+          echo "Runtime DLL collection completed; isolated Windows smoke test is authoritative."
 
       - name: Smoke-test portable package and create ZIP
         shell: pwsh
