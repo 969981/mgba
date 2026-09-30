@@ -61,13 +61,13 @@ jobs:
 
           QTSTATIC_LIB=/mingw64/qt5-static/lib
           QTPNG="$QTSTATIC_LIB/libqtlibpng.a"
-          QTZLIB="$QTSTATIC_LIB/libqtzlib.a"
+          ZLIB_STATIC=/mingw64/lib/libz.a
           SDL2_STATIC=/mingw64/lib/libSDL2.a
           SDL2MAIN_STATIC=/mingw64/lib/libSDL2main.a
           EPOXY_STATIC=/mingw64/lib/libepoxy.a
 
           echo 'Static libraries selected:'
-          for lib in "$QTPNG" "$QTZLIB" "$SDL2_STATIC" "$SDL2MAIN_STATIC" "$EPOXY_STATIC"; do
+          for lib in "$QTPNG" "$ZLIB_STATIC" "$SDL2_STATIC" "$SDL2MAIN_STATIC" "$EPOXY_STATIC"; do
             if [[ ! -f "$lib" ]]; then
               echo "Required static library missing: $lib" >&2
               ls -la "$(dirname "$lib")" | head -100 || true
@@ -76,10 +76,10 @@ jobs:
             ls -lh "$lib"
           done
 
-          # Qt5-static already embeds its own libpng/zlib. Reuse those exact
-          # archives for mGBA too, instead of mixing Qt's libqtlibpng with the
-          # system libpng DLL import library (which causes duplicate png_* symbols).
-          # Force SDL2 and epoxy to their real static archives as well.
+          # qt5-static ships a private static libpng but uses the normal static
+          # MinGW zlib archive. Make mGBA use the same pair instead of mixing
+          # Qt's libqtlibpng.a with libpng.dll.a (the original duplicate-symbol bug).
+          # SDL2 and epoxy are also pinned to real .a archives, never DLL imports.
           cmake -S . -B build-static -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_PREFIX_PATH=/mingw64/qt5-static \
@@ -99,8 +99,8 @@ jobs:
             -DEPOXY_LIBRARIES="$EPOXY_STATIC" \
             -DEPOXY_INCLUDE_DIRS=/mingw64/include \
             -DUSE_ZLIB=ON \
-            -DZLIB_LIBRARY="$QTZLIB" \
-            -DZLIB_LIBRARY_RELEASE="$QTZLIB" \
+            -DZLIB_LIBRARY="$ZLIB_STATIC" \
+            -DZLIB_LIBRARY_RELEASE="$ZLIB_STATIC" \
             -DZLIB_INCLUDE_DIR=/mingw64/include \
             -DUSE_PNG=ON \
             -DPNG_LIBRARY="$QTPNG" \
@@ -193,6 +193,7 @@ jobs:
           $stdout = Join-Path $PWD 'mgba-gui.stdout.txt'
           $stderr = Join-Path $PWD 'mgba-gui.stderr.txt'
           $oldPath = $env:PATH
+          $p = $null
           try {
             # Deliberately exclude MSYS2/Qt/developer directories. This is a real
             # no-argument GUI launch, not --version (which exits before Qt starts).
@@ -210,7 +211,7 @@ jobs:
             }
             Write-Host "mGBA GUI stayed alive. PID=$($p.Id) MainWindowHandle=$($p.MainWindowHandle)"
             if ($p.MainWindowHandle -eq 0) {
-              Write-Warning 'Process is alive but runner did not expose a main window handle; keeping lifecycle gate as the portable-runtime test.'
+              Write-Warning 'Process is alive but runner did not expose a main window handle; lifecycle gate still proves the full Qt startup path did not immediately abort.'
             }
           } finally {
             if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
