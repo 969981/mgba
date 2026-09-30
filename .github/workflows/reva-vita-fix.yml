@@ -62,6 +62,7 @@ jobs:
           path: mGBA-FRLG-RevA-vita.7z
           if-no-files-found: error
       - name: Publish Vita asset
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
