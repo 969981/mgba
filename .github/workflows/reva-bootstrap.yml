@@ -1,0 +1,99 @@
+name: Rebase FRLG RevA and build Windows x64
+
+on:
+  push:
+    branches:
+      - revA-bootstrap
+
+permissions:
+  contents: write
+
+jobs:
+  rebase-build-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout bootstrap branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up MSYS2 MinGW64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel
+            git
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ffmpeg
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-gdb
+            mingw-w64-x86_64-libelf
+            mingw-w64-x86_64-libepoxy
+            mingw-w64-x86_64-libzip
+            mingw-w64-x86_64-lua
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-qt5
+            mingw-w64-x86_64-SDL2
+            mingw-w64-x86_64-ntldd-git
+
+      - name: Rebase the two RevA commits onto latest master
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote remove aryan 2>/dev/null || true
+          git remote add aryan https://github.com/Aryan10/mgba-frlg-revA.git
+          git fetch aryan master
+          git fetch origin master revA
+          git switch -C revA origin/master
+          git cherry-pick 0102d3e9db8971ee443857044a1c3b607b0df6e4
+          git cherry-pick 9fd56025c6fc95c6edf6b97e3ad06805655d7849
+          REVA_HEAD=$(git rev-parse HEAD)
+          echo "REVA_HEAD=$REVA_HEAD" >> "$GITHUB_ENV"
+          git log --oneline --decorate -4
+          git push origin revA
+
+      - name: Configure mGBA
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          cmake -S . -B build -G "MSYS Makefiles" -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build mGBA
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          cmake --build build --parallel 2
+
+      - name: Package distributable ZIP
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          cd build
+          cpack -G ZIP
+          ls -lah *.zip
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mGBA-FRLG-RevA-Windows-x64
+          path: build/*.zip
+          if-no-files-found: error
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = 'revA-20260930'
+          git tag -f $tag $env:REVA_HEAD
+          git push origin "refs/tags/$tag" --force
+          $assets = Get-ChildItem build -Filter *.zip | ForEach-Object { $_.FullName }
+          gh release delete $tag --yes --cleanup-tag 2>$null
+          git tag -f $tag $env:REVA_HEAD
+          git push origin "refs/tags/$tag" --force
+          gh release create $tag @assets --title 'mGBA FRLG RevA (2026-09-30)' --notes "Built from 969981/mgba master c3c8e5e with Aryan10/mgba-frlg-revA commits 0102d3e and 9fd5602 rebased on top. Includes the SWI 0x48 FRLG RevA save fix."
