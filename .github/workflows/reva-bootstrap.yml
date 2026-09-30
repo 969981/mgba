@@ -112,12 +112,25 @@ jobs:
             if (Test-Path $doc) { Copy-Item $doc (Join-Path $portable ($doc + '.txt')) }
           }
 
-          # Do not use --compiler-runtime here. It drops the entire ~25 MiB
-          # vc_redist.x64.exe installer into a portable archive. We resolve and
-          # copy only the individual VC runtime DLLs actually imported below.
+          # Qt 5 windeployqt defaults to deploying the compiler runtime on Windows.
+          # Disable that explicitly so the ~25 MiB vc_redist.x64.exe installer is
+          # never embedded in the portable archive. Required VC runtime DLLs are
+          # resolved and copied app-locally below.
           $windeployqt = (Get-Command windeployqt.exe -ErrorAction Stop).Source
-          & $windeployqt --release --no-translations --no-opengl-sw --no-system-d3d-compiler --no-svg $portable\mGBA.exe
+          & $windeployqt --release --no-compiler-runtime --no-translations --no-opengl-sw --no-system-d3d-compiler --no-svg $portable\mGBA.exe
           if ($LASTEXITCODE -ne 0) { throw 'windeployqt failed' }
+
+          # mGBA uses QAudioOutput directly, not QMediaPlayer/media-service or
+          # playlist APIs. Keep QtMultimedia and the audio plugins, but drop the
+          # unrelated media-service/playlist plugin payload from the portable tree.
+          foreach ($pluginDir in @('mediaservice','playlistformats')) {
+            $pluginPath = Join-Path $portable $pluginDir
+            if (Test-Path $pluginPath) {
+              $pluginBytes = (Get-ChildItem $pluginPath -Recurse -File | Measure-Object Length -Sum).Sum
+              Remove-Item $pluginPath -Recurse -Force
+              Write-Host ("Pruned Qt plugin directory {0}: {1:N2} MiB" -f $pluginDir, ($pluginBytes / 1MB))
+            }
+          }
 
           $vcpkgBin = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed\x64-windows-release\bin'
           if (-not (Test-Path $vcpkgBin)) { throw "vcpkg bin not found: $vcpkgBin" }
@@ -181,9 +194,8 @@ jobs:
             }
           }
 
-          # PE imports that are supplied by Windows/Qt plugin loading can be
-          # absent from the two private runtime roots. Print them for auditing;
-          # the isolated launch test below remains the final runtime gate.
+          # PE imports supplied by Windows can be absent from the private runtime
+          # roots. Print them for auditing; isolated launch remains the runtime gate.
           if ($unresolved.Count -gt 0) {
             Write-Host 'Unresolved non-system imports (audit):'
             $unresolved | Sort-Object | ForEach-Object { Write-Host "  $_" }
@@ -192,6 +204,7 @@ jobs:
           if (Test-Path (Join-Path $portable 'vc_redist.x64.exe')) { throw 'Full VC redistributable installer must not be packaged' }
           if (Test-Path (Join-Path $portable 'libmgba.dll')) { throw 'libmgba.dll unexpectedly present' }
           if (-not (Test-Path (Join-Path $portable 'platforms\qwindows.dll'))) { throw 'Qt platform plugin missing' }
+          if (-not (Test-Path (Join-Path $portable 'audio'))) { throw 'Qt audio plugins missing' }
 
           Write-Host 'Packaged files:'
           Get-ChildItem $portable -Recurse -File | Sort-Object Length -Descending | Select-Object Length,FullName | Format-Table -AutoSize
@@ -224,7 +237,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $asset = Join-Path $PWD 'mGBA-FRLG-RevA-win64.7z'
           Remove-Item $asset -Force -ErrorAction SilentlyContinue
-          & 7z a -t7z -mx=9 -m0=lzma2 -ms=on $asset '.\portable\*'
+          & 7z a -t7z -mx=9 -m0=lzma2:d=64m:fb=273 -ms=on -mmt=on $asset '.\portable\*'
           if ($LASTEXITCODE -ne 0) { throw '7z packaging failed' }
           $item = Get-Item $asset
           $hash = Get-FileHash $asset -Algorithm SHA256
@@ -253,6 +266,6 @@ jobs:
           if ($tagSha -ne $expected) { throw "Tag $tag points to $tagSha, expected $expected" }
           gh release upload $tag $asset --repo $repo --clobber
           if ($LASTEXITCODE -ne 0) { throw 'Release upload failed' }
-          gh release edit $tag --repo $repo --notes 'FRLG RevA multi-platform release. Windows x64 is packaged with an official-style MSVC + vcpkg + Qt MSVC toolchain instead of an MSYS2/MinGW runtime tree. The mGBA core is static and LTO-enabled; FFmpeg, Lua, SQLite, ELF and other nonessential distribution dependencies are disabled. The Windows portable archive bundles only the individual MSVC runtime DLLs actually imported by the binaries instead of embedding the full VC redistributable installer. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
+          gh release edit $tag --repo $repo --notes 'FRLG RevA multi-platform release. Windows x64 is packaged with an official-style MSVC + vcpkg + Qt MSVC toolchain instead of an MSYS2/MinGW runtime tree. The mGBA core is static and LTO-enabled; FFmpeg, Lua, SQLite, ELF and other nonessential distribution dependencies are disabled. The Windows portable archive omits the full VC redistributable installer, bundles only imported MSVC runtime DLLs, and prunes unused Qt media-service and playlist plugins. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
           if ($LASTEXITCODE -ne 0) { throw 'Release metadata update failed' }
           gh release view $tag --repo $repo --json url,assets
