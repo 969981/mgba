@@ -1,0 +1,280 @@
+name: Build FRLG RevA multi-platform release
+
+on:
+  push:
+    branches:
+      - revA-bootstrap
+    paths:
+      - .github/workflows/reva-all-platforms.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: reva-all-platforms
+  cancel-in-progress: true
+
+env:
+  REV_SHA: fadbf93a565a5bd0b3e7f12b848fc208064a94f1
+  RELEASE_TAG: revA-20260930
+
+jobs:
+  win32:
+    name: Windows x86
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revA
+          fetch-depth: 0
+      - name: Verify source
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD).Trim() -ne '${{ env.REV_SHA }}') { throw 'revA moved' }
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW32
+          update: true
+          install: >-
+            base-devel
+            git
+            unzip
+            p7zip
+            mingw-w64-i686-cmake
+            mingw-w64-i686-ffmpeg
+            mingw-w64-i686-gcc
+            mingw-w64-i686-gdb
+            mingw-w64-i686-libelf
+            mingw-w64-i686-libepoxy
+            mingw-w64-i686-libzip
+            mingw-w64-i686-lua
+            mingw-w64-i686-pkgconf
+            mingw-w64-i686-qt5
+            mingw-w64-i686-SDL2
+            mingw-w64-i686-ntldd-git
+      - name: Build and package
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          cmake -S . -B build -G "MSYS Makefiles" -DCMAKE_BUILD_TYPE=Release -DDISTBUILD=ON -DBUILD_STATIC=ON -DBUILD_SHARED=OFF
+          cmake --build build --parallel 2
+          (cd build && cpack -G ZIP)
+          mkdir -p unpack portable
+          unzip -q "$(find build -maxdepth 1 -iname '*.zip' | head -n1)" -d unpack
+          ROOT=$(find unpack -mindepth 1 -maxdepth 1 -type d | head -n1)
+          if [ "$(find unpack -mindepth 1 -maxdepth 1 | wc -l)" -eq 1 ] && [ -n "$ROOT" ]; then cp -a "$ROOT"/. portable/; else cp -a unpack/. portable/; fi
+          rm -rf portable/include portable/lib portable/share/man
+          rm -f portable/libmgba.a portable/libmgba.dll portable/libmgba.dll.a
+          ./tools/deploy-win.sh "$PWD/portable/mGBA.exe" "$PWD/portable" "$PWD"
+          ./tools/deploy-win.sh "$PWD/portable/mgba-sdl.exe" "$PWD/portable" "$PWD"
+          find portable -maxdepth 1 -type f \( -iname '*.exe' -o -iname '*.dll' \) -print0 | xargs -0 -r -n1 sh -c 'strip --strip-unneeded "$1" 2>/dev/null || true' _
+          7z a -t7z -mx=9 -ms=on mGBA-FRLG-RevA-win32.7z ./portable/*
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $old = $env:PATH
+          try {
+            $env:PATH = "$PWD\portable;C:\Windows\System32;C:\Windows"
+            foreach ($exe in @('mgba-sdl.exe','mGBA.exe')) {
+              $p = Start-Process -FilePath (Join-Path $PWD "portable\$exe") -ArgumentList '--version' -WorkingDirectory (Join-Path $PWD 'portable') -Wait -PassThru
+              if ($p.ExitCode -ne 0) { throw "$exe failed: $($p.ExitCode)" }
+            }
+          } finally { $env:PATH = $old }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-win32
+          path: mGBA-FRLG-RevA-win32.7z
+          if-no-files-found: error
+
+  linux:
+    name: Linux x64
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revA
+          fetch-depth: 0
+      - name: Verify source
+        run: test "$(git rev-parse HEAD)" = "$REV_SHA"
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build qtbase5-dev qttools5-dev-tools libsdl2-dev libepoxy-dev libzip-dev libelf-dev libavcodec-dev libavfilter-dev libavformat-dev libavutil-dev libswscale-dev liblua5.4-dev libpng-dev zlib1g-dev libsqlite3-dev libedit-dev libfreetype6-dev libjson-c-dev liblzma-dev
+      - name: Build and package
+        run: |
+          set -euxo pipefail
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDISTBUILD=ON -DBUILD_STATIC=ON -DBUILD_SHARED=OFF
+          cmake --build build --parallel 2
+          find build -type f -perm -111 -name 'mgba*' -print
+          (cd build && cpack -G TXZ)
+          PKG=$(find build -maxdepth 1 -type f \( -name '*.tar.xz' -o -name '*.txz' \) | head -n1)
+          test -n "$PKG"
+          cp "$PKG" mGBA-FRLG-RevA-linux-x64.tar.xz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-x64
+          path: mGBA-FRLG-RevA-linux-x64.tar.xz
+          if-no-files-found: error
+
+  macos:
+    name: macOS x64
+    runs-on: macos-13
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revA
+          fetch-depth: 0
+      - name: Verify source
+        run: test "$(git rev-parse HEAD)" = "$REV_SHA"
+      - name: Install dependencies
+        run: |
+          brew update
+          brew install cmake ninja qt@5 sdl2 ffmpeg libzip libepoxy lua
+          echo "$(brew --prefix qt@5)/bin" >> "$GITHUB_PATH"
+      - name: Build and package
+        run: |
+          set -euxo pipefail
+          export PATH="$(brew --prefix qt@5)/bin:$PATH"
+          export CMAKE_PREFIX_PATH="$(brew --prefix qt@5)"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDISTBUILD=ON -DBUILD_STATIC=ON -DBUILD_SHARED=OFF -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH"
+          cmake --build build --parallel 2
+          (cd build && cpack -G DragNDrop)
+          DMG=$(find build -maxdepth 1 -type f -name '*.dmg' | head -n1)
+          test -n "$DMG"
+          cp "$DMG" mGBA-FRLG-RevA-macos-x64.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-x64
+          path: mGBA-FRLG-RevA-macos-x64.dmg
+          if-no-files-found: error
+
+  devkitpro:
+    name: ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: 3ds
+            label: Nintendo 3DS
+            image: devkitpro/devkitarm:latest
+            group: 3ds-dev
+            toolchain: src/platform/3ds/CMakeToolchain.txt
+            asset: mGBA-FRLG-RevA-3ds.7z
+          - platform: switch
+            label: Nintendo Switch
+            image: devkitpro/devkita64:latest
+            group: switch-dev
+            toolchain: src/platform/switch/CMakeToolchain.txt
+            asset: mGBA-FRLG-RevA-switch.7z
+          - platform: wii
+            label: Nintendo Wii
+            image: devkitpro/devkitppc:latest
+            group: wii-dev
+            toolchain: src/platform/wii/CMakeToolchain.txt
+            asset: mGBA-FRLG-RevA-wii.7z
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revA
+          fetch-depth: 0
+      - name: Verify source
+        run: test "$(git rev-parse HEAD)" = "$REV_SHA"
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y cmake ninja-build p7zip-full
+          dkp-pacman -Syu --noconfirm
+          dkp-pacman -S --needed --noconfirm "${{ matrix.group }}"
+      - name: Build and package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDISTBUILD=ON -DCMAKE_TOOLCHAIN_FILE="${{ matrix.toolchain }}"
+          cmake --build build --parallel 2
+          rm -rf stage
+          cmake --install build --prefix "$PWD/stage"
+          find stage -type f -print
+          7z a -t7z -mx=9 -ms=on "${{ matrix.asset }}" ./stage/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  vita:
+    name: PlayStation Vita
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    container:
+      image: vitasdk/vitasdk:latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: revA
+          fetch-depth: 0
+      - name: Verify source
+        run: test "$(git rev-parse HEAD)" = "$REV_SHA"
+      - name: Install build tools
+        shell: bash
+        run: |
+          if command -v apt-get >/dev/null; then apt-get update && apt-get install -y cmake ninja-build p7zip-full; fi
+          if command -v apk >/dev/null; then apk add --no-cache cmake ninja p7zip; fi
+      - name: Build and package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDISTBUILD=ON -DCMAKE_TOOLCHAIN_FILE=src/platform/psp2/CMakeToolchain.vitasdk
+          cmake --build build --parallel 2
+          rm -rf stage
+          cmake --install build --prefix "$PWD/stage"
+          find stage -type f -print
+          7z a -t7z -mx=9 -ms=on mGBA-FRLG-RevA-vita.7z ./stage/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-vita
+          path: mGBA-FRLG-RevA-vita.7z
+          if-no-files-found: error
+
+  publish:
+    name: Attach successful platform builds to Release
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - win32
+      - linux
+      - macos
+      - devkitpro
+      - vita
+    steps:
+      - name: Download successful artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Show assets
+        run: find release-assets -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+      - name: Upload to existing RevA release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          shopt -s nullglob
+          files=(release-assets/*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo 'No platform build succeeded; nothing to publish.'
+            exit 1
+          fi
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+          for f in "${files[@]}"; do
+            gh release upload "$RELEASE_TAG" "$f" --repo "$GITHUB_REPOSITORY" --clobber
+          done
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json url,tagName,assets
