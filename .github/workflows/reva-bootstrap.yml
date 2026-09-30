@@ -43,6 +43,11 @@ jobs:
           arch: win64_msvc2019_64
           cache: true
 
+      - name: Set up MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Prepare vcpkg release dependencies
         shell: pwsh
         run: |
@@ -58,7 +63,8 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $toolchain = Join-Path $env:VCPKG_INSTALLATION_ROOT 'scripts\buildsystems\vcpkg.cmake'
           $runtimeOut = (Join-Path $PWD 'build-release\runtime').Replace('\','/')
-          cmake -S . -B build-release -A x64 `
+          cmake -S . -B build-release -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_TOOLCHAIN_FILE="$toolchain" `
             -DVCPKG_TARGET_TRIPLET=x64-windows-release `
             -DDISTBUILD=ON `
@@ -73,14 +79,14 @@ jobs:
             -DUSE_SQLITE3=OFF `
             -DUSE_JSON_C=OFF `
             -DUSE_DISCORD_RPC=OFF `
-            -DCMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE="$runtimeOut"
+            -DCMAKE_RUNTIME_OUTPUT_DIRECTORY="$runtimeOut"
           if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
 
       - name: Build Release
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          cmake --build build-release --config Release --parallel 2
+          cmake --build build-release --parallel 2
           if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
           Get-ChildItem build-release -Recurse -Filter *.exe | Select-Object FullName,Length | Format-Table -AutoSize
 
