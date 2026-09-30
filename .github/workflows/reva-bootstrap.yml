@@ -66,6 +66,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_TOOLCHAIN_FILE="$toolchain" `
             -DVCPKG_TARGET_TRIPLET=x64-windows-release `
+            -DCMAKE_C_FLAGS=/DPNG_ALLOCATED= `
+            -DCMAKE_CXX_FLAGS=/DPNG_ALLOCATED= `
             -DDISTBUILD=ON `
             -DBUILD_STATIC=ON `
             -DBUILD_SHARED=OFF `
