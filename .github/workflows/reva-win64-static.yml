@@ -51,6 +51,7 @@ jobs:
             mingw-w64-x86_64-libepoxy
             mingw-w64-x86_64-libpng
             mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-zstd
             mingw-w64-x86_64-openssl
 
       - name: Configure static MinGW64 distribution build
@@ -62,24 +63,48 @@ jobs:
           QTSTATIC_LIB=/mingw64/qt5-static/lib
           QTPNG="$QTSTATIC_LIB/libqtlibpng.a"
           ZLIB_STATIC=/mingw64/lib/libz.a
+          ZSTD_STATIC=/mingw64/lib/libzstd.a
+          SSL_STATIC=/mingw64/lib/libssl.a
+          CRYPTO_STATIC=/mingw64/lib/libcrypto.a
           SDL2_STATIC=/mingw64/lib/libSDL2.a
           SDL2MAIN_STATIC=/mingw64/lib/libSDL2main.a
           EPOXY_STATIC=/mingw64/lib/libepoxy.a
 
           echo 'Static libraries selected:'
-          for lib in "$QTPNG" "$ZLIB_STATIC" "$SDL2_STATIC" "$SDL2MAIN_STATIC" "$EPOXY_STATIC"; do
+          for lib in "$QTPNG" "$ZLIB_STATIC" "$ZSTD_STATIC" "$SSL_STATIC" "$CRYPTO_STATIC" "$SDL2_STATIC" "$SDL2MAIN_STATIC" "$EPOXY_STATIC"; do
             if [[ ! -f "$lib" ]]; then
               echo "Required static library missing: $lib" >&2
-              ls -la "$(dirname "$lib")" | head -100 || true
+              ls -la "$(dirname "$lib")" | head -120 || true
               exit 1
             fi
             ls -lh "$lib"
           done
 
-          # qt5-static ships a private static libpng but uses the normal static
-          # MinGW zlib archive. Make mGBA use the same pair instead of mixing
-          # Qt's libqtlibpng.a with libpng.dll.a (the original duplicate-symbol bug).
-          # SDL2 and epoxy are also pinned to real .a archives, never DLL imports.
+          # MSYS2's Qt5-static archives are static, but their generated CMake/PRL
+          # metadata can still name the dynamic import libraries of external
+          # OpenSSL/zstd dependencies explicitly. Rewrite only those external
+          # import-library references to the matching real static archives.
+          echo '==== Qt static metadata references before patch ===='
+          grep -RniE 'lib(ssl|crypto|zstd)(-[^/; ]+)?\.dll\.a|(^|[ ;])-l(ssl|crypto|zstd)([ ;]|$)' \
+            /mingw64/qt5-static/lib/cmake /mingw64/qt5-static/lib/*.prl /mingw64/qt5-static/lib/pkgconfig 2>/dev/null | head -200 || true
+
+          while IFS= read -r -d '' f; do
+            sed -i \
+              -e 's#libssl\.dll\.a#libssl.a#g' \
+              -e 's#libcrypto\.dll\.a#libcrypto.a#g' \
+              -e 's#libzstd\.dll\.a#libzstd.a#g' "$f"
+          done < <(grep -RIlZ -E 'lib(ssl|crypto|zstd)\.dll\.a' \
+            /mingw64/qt5-static/lib/cmake /mingw64/qt5-static/lib /mingw64/qt5-static/lib/pkgconfig 2>/dev/null || true)
+
+          echo '==== remaining explicit DLL import references after patch ===='
+          if grep -RniE 'lib(ssl|crypto|zstd)\.dll\.a' \
+            /mingw64/qt5-static/lib/cmake /mingw64/qt5-static/lib/*.prl /mingw64/qt5-static/lib/pkgconfig 2>/dev/null; then
+            echo 'Qt metadata still contains OpenSSL/zstd DLL import libraries.' >&2
+            exit 1
+          fi
+
+          # qt5-static ships a private static libpng but uses normal MinGW zlib.
+          # Pin mGBA's own dependencies to real archives as well.
           cmake -S . -B build-static -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_PREFIX_PATH=/mingw64/qt5-static \
@@ -121,7 +146,14 @@ jobs:
           echo '==== selected dependency cache entries ===='
           grep -Ei '^(PNG_|ZLIB_|SDL2|EPOXY_).*=' build-static/CMakeCache.txt || true
           if grep -Ei '^(PNG_|ZLIB_|SDL2|EPOXY_).*=[^;]*\.dll\.a' build-static/CMakeCache.txt; then
-            echo 'A dependency resolved to a DLL import library; refusing non-static build.' >&2
+            echo 'A direct mGBA dependency resolved to a DLL import library.' >&2
+            exit 1
+          fi
+
+          echo '==== OpenSSL/zstd references in generated Ninja link graph ===='
+          grep -niE 'lib(ssl|crypto|zstd)(-[^/ ]+)?(\.dll)?\.a|-l(ssl|crypto|zstd)' build-static/build.ninja | head -120 || true
+          if grep -qiE 'lib(ssl|crypto|zstd)(-[^/ ]+)?\.dll\.a' build-static/build.ninja; then
+            echo 'Generated build still references an OpenSSL/zstd DLL import library.' >&2
             exit 1
           fi
 
@@ -144,7 +176,7 @@ jobs:
             echo "==== $exe imports ===="
             imports=$(objdump -p "$exe" | awk '/DLL Name:/ {print $3}')
             printf '%s\n' "$imports"
-            if printf '%s\n' "$imports" | grep -Eqi '(^|/)(Qt[56]|SDL2|libepoxy|libpng|zlib|zlib1|libgcc|libstdc\+\+|libwinpthread|libcrypto|libssl).*\.dll$'; then
+            if printf '%s\n' "$imports" | grep -Eqi '(^|/)(Qt[56]|SDL2|libepoxy|libpng|zlib|zlib1|libzstd|libgcc|libstdc\+\+|libwinpthread|libcrypto|libssl).*\.dll$'; then
               echo "Unexpected non-system runtime dependency in $exe"
               bad=1
             fi
@@ -195,13 +227,12 @@ jobs:
           $oldPath = $env:PATH
           $p = $null
           try {
-            # Deliberately exclude MSYS2/Qt/developer directories. This is a real
-            # no-argument GUI launch, not --version (which exits before Qt starts).
+            # This deliberately executes the real GUI startup path. --version is
+            # not a valid runtime test because mGBA exits before QApplication.
             $env:PATH = "$portable;C:\Windows\System32;C:\Windows"
-            $env:QT_DEBUG_PLUGINS = '1'
             $p = Start-Process -FilePath $exe -WorkingDirectory $portable -PassThru `
               -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-            Start-Sleep -Seconds 8
+            Start-Sleep -Seconds 10
             $p.Refresh()
             if ($p.HasExited) {
               Write-Host "mGBA GUI exited early with code $($p.ExitCode)"
@@ -210,16 +241,11 @@ jobs:
               throw 'mGBA GUI failed real launch test'
             }
             Write-Host "mGBA GUI stayed alive. PID=$($p.Id) MainWindowHandle=$($p.MainWindowHandle)"
-            if ($p.MainWindowHandle -eq 0) {
-              Write-Warning 'Process is alive but runner did not expose a main window handle; lifecycle gate still proves the full Qt startup path did not immediately abort.'
-            }
           } finally {
             if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
             $env:PATH = $oldPath
-            Remove-Item Env:QT_DEBUG_PLUGINS -ErrorAction SilentlyContinue
           }
 
-          # SDL CLI path should also execute from the same isolated package.
           $sdl = Join-Path $portable 'mgba-sdl.exe'
           $sdlp = Start-Process -FilePath $sdl -ArgumentList '--version' -WorkingDirectory $portable -Wait -PassThru
           if ($sdlp.ExitCode -ne 0) { throw "mgba-sdl.exe --version exited $($sdlp.ExitCode)" }
@@ -259,6 +285,6 @@ jobs:
           if ($tagSha -ne $expected) { throw "Tag $tag points to $tagSha, expected $expected" }
           gh release upload $tag $asset --repo $repo --clobber
           if ($LASTEXITCODE -ne 0) { throw 'Release upload failed' }
-          gh release edit $tag --repo $repo --notes 'FRLG RevA multi-platform release. Windows x64 uses an official-style static MinGW64 + Qt 5 build. Qt, SDL2, libepoxy, PNG/zlib and compiler runtimes are linked into the executables instead of shipped as loose runtime DLLs. The Windows package is only published after a real no-argument GUI launch test in an isolated PATH; --version alone is not accepted as a GUI/runtime test. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
+          gh release edit $tag --repo $repo --notes 'FRLG RevA multi-platform release. Windows x64 uses an official-style static MinGW64 + Qt 5 build. Qt, SDL2, libepoxy, PNG/zlib, OpenSSL/zstd and compiler runtimes are linked into the executables instead of shipped as loose runtime DLLs. The Windows package is only published after PE import auditing and a real no-argument GUI launch test in an isolated PATH; --version alone is not accepted as a GUI/runtime test. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
           if ($LASTEXITCODE -ne 0) { throw 'Release metadata update failed' }
           gh release view $tag --repo $repo --json url,assets
