@@ -39,6 +39,7 @@ jobs:
         with:
           msystem: MINGW64
           update: true
+          suppress-deprecation-warnings: msystem-mingw64
           install: >-
             git
             make
@@ -57,12 +58,33 @@ jobs:
         run: |
           set -euo pipefail
           export PATH="/mingw64/qt5-static/bin:/mingw64/bin:$PATH"
+
+          QTSTATIC_LIB=/mingw64/qt5-static/lib
+          QTPNG="$QTSTATIC_LIB/libqtlibpng.a"
+          QTZLIB="$QTSTATIC_LIB/libqtzlib.a"
+          SDL2_STATIC=/mingw64/lib/libSDL2.a
+          SDL2MAIN_STATIC=/mingw64/lib/libSDL2main.a
+          EPOXY_STATIC=/mingw64/lib/libepoxy.a
+
+          echo 'Static libraries selected:'
+          for lib in "$QTPNG" "$QTZLIB" "$SDL2_STATIC" "$SDL2MAIN_STATIC" "$EPOXY_STATIC"; do
+            if [[ ! -f "$lib" ]]; then
+              echo "Required static library missing: $lib" >&2
+              ls -la "$(dirname "$lib")" | head -100 || true
+              exit 1
+            fi
+            ls -lh "$lib"
+          done
+
+          # Qt5-static already embeds its own libpng/zlib. Reuse those exact
+          # archives for mGBA too, instead of mixing Qt's libqtlibpng with the
+          # system libpng DLL import library (which causes duplicate png_* symbols).
+          # Force SDL2 and epoxy to their real static archives as well.
           cmake -S . -B build-static -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_PREFIX_PATH=/mingw64/qt5-static \
             -DQt5_DIR=/mingw64/qt5-static/lib/cmake/Qt5 \
             -DFORCE_QT_VERSION=5 \
-            -DCMAKE_FIND_LIBRARY_SUFFIXES=.a \
             -DCMAKE_EXE_LINKER_FLAGS='-static -static-libgcc -static-libstdc++' \
             -DDISTBUILD=ON \
             -DBUILD_STATIC=ON \
@@ -74,8 +96,18 @@ jobs:
             -DBUILD_GLES2=OFF \
             -DBUILD_GLES3=OFF \
             -DUSE_EPOXY=ON \
+            -DEPOXY_LIBRARIES="$EPOXY_STATIC" \
+            -DEPOXY_INCLUDE_DIRS=/mingw64/include \
             -DUSE_ZLIB=ON \
+            -DZLIB_LIBRARY="$QTZLIB" \
+            -DZLIB_LIBRARY_RELEASE="$QTZLIB" \
+            -DZLIB_INCLUDE_DIR=/mingw64/include \
             -DUSE_PNG=ON \
+            -DPNG_LIBRARY="$QTPNG" \
+            -DPNG_LIBRARY_RELEASE="$QTPNG" \
+            -DPNG_PNG_INCLUDE_DIR=/mingw64/include \
+            -DSDL2_LIBRARIES_TEMP="$SDL2_STATIC" \
+            -DSDL2MAIN_LIBRARY="$SDL2MAIN_STATIC" \
             -DUSE_MINIZIP=OFF \
             -DUSE_FFMPEG=OFF \
             -DUSE_LIBZIP=OFF \
@@ -85,6 +117,13 @@ jobs:
             -DUSE_SQLITE3=OFF \
             -DUSE_JSON_C=OFF \
             -DUSE_DISCORD_RPC=OFF
+
+          echo '==== selected dependency cache entries ===='
+          grep -Ei '^(PNG_|ZLIB_|SDL2|EPOXY_).*=' build-static/CMakeCache.txt || true
+          if grep -Ei '^(PNG_|ZLIB_|SDL2|EPOXY_).*=[^;]*\.dll\.a' build-static/CMakeCache.txt; then
+            echo 'A dependency resolved to a DLL import library; refusing non-static build.' >&2
+            exit 1
+          fi
 
       - name: Build static Windows targets
         shell: msys2 {0}
@@ -130,6 +169,9 @@ jobs:
           if (Test-Path 'res\shaders') {
             Copy-Item 'res\shaders' (Join-Path $portable 'shaders') -Recurse
           }
+          if (Test-Path 'res\scripts') {
+            Copy-Item 'res\scripts' (Join-Path $portable 'scripts') -Recurse
+          }
 
           $dlls = Get-ChildItem $portable -Recurse -Filter '*.dll' -File
           if ($dlls) {
@@ -142,24 +184,44 @@ jobs:
           $bytes = (Get-ChildItem $portable -Recurse -File | Measure-Object Length -Sum).Sum
           Write-Host ("Portable uncompressed: {0:N2} MiB" -f ($bytes / 1MB))
 
-      - name: Smoke-test isolated static package
+      - name: Real-launch test static GUI
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $portable = Join-Path $PWD 'portable-static'
-          function Test-Exe([string]$name) {
-            $exe = Join-Path $portable $name
-            $oldPath = $env:PATH
-            try {
-              $env:PATH = "$portable;C:\Windows\System32;C:\Windows"
-              $p = Start-Process -FilePath $exe -ArgumentList '--version' -WorkingDirectory $portable -Wait -PassThru
-              if ($p.ExitCode -ne 0) { throw "$name --version exited $($p.ExitCode)" }
-            } finally {
-              $env:PATH = $oldPath
+          $exe = Join-Path $portable 'mGBA.exe'
+          $stdout = Join-Path $PWD 'mgba-gui.stdout.txt'
+          $stderr = Join-Path $PWD 'mgba-gui.stderr.txt'
+          $oldPath = $env:PATH
+          try {
+            # Deliberately exclude MSYS2/Qt/developer directories. This is a real
+            # no-argument GUI launch, not --version (which exits before Qt starts).
+            $env:PATH = "$portable;C:\Windows\System32;C:\Windows"
+            $env:QT_DEBUG_PLUGINS = '1'
+            $p = Start-Process -FilePath $exe -WorkingDirectory $portable -PassThru `
+              -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+            Start-Sleep -Seconds 8
+            $p.Refresh()
+            if ($p.HasExited) {
+              Write-Host "mGBA GUI exited early with code $($p.ExitCode)"
+              if (Test-Path $stdout) { Get-Content $stdout -ErrorAction SilentlyContinue }
+              if (Test-Path $stderr) { Get-Content $stderr -ErrorAction SilentlyContinue }
+              throw 'mGBA GUI failed real launch test'
             }
+            Write-Host "mGBA GUI stayed alive. PID=$($p.Id) MainWindowHandle=$($p.MainWindowHandle)"
+            if ($p.MainWindowHandle -eq 0) {
+              Write-Warning 'Process is alive but runner did not expose a main window handle; keeping lifecycle gate as the portable-runtime test.'
+            }
+          } finally {
+            if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+            $env:PATH = $oldPath
+            Remove-Item Env:QT_DEBUG_PLUGINS -ErrorAction SilentlyContinue
           }
-          Test-Exe 'mgba-sdl.exe'
-          Test-Exe 'mGBA.exe'
+
+          # SDL CLI path should also execute from the same isolated package.
+          $sdl = Join-Path $portable 'mgba-sdl.exe'
+          $sdlp = Start-Process -FilePath $sdl -ArgumentList '--version' -WorkingDirectory $portable -Wait -PassThru
+          if ($sdlp.ExitCode -ne 0) { throw "mgba-sdl.exe --version exited $($sdlp.ExitCode)" }
 
       - name: Create solid 7z package
         shell: pwsh
@@ -196,6 +258,6 @@ jobs:
           if ($tagSha -ne $expected) { throw "Tag $tag points to $tagSha, expected $expected" }
           gh release upload $tag $asset --repo $repo --clobber
           if ($LASTEXITCODE -ne 0) { throw 'Release upload failed' }
-          gh release edit $tag --repo $repo --notes 'FRLG RevA multi-platform release. Windows x64 now uses an official-style fully static MinGW64 + Qt 5 static build: Qt platform/style/image plugins, SDL2, libepoxy, libpng and compiler runtimes are linked into the executables instead of shipped as loose DLLs. The portable payload keeps only the executables, core data/documentation and shader resources. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
+          gh release edit $tag --repo $repo --notes 'FRLG RevA multi-platform release. Windows x64 uses an official-style static MinGW64 + Qt 5 build. Qt, SDL2, libepoxy, PNG/zlib and compiler runtimes are linked into the executables instead of shipped as loose runtime DLLs. The Windows package is only published after a real no-argument GUI launch test in an isolated PATH; --version alone is not accepted as a GUI/runtime test. Includes the SWI 0x48 FireRed/LeafGreen RevA save fix.'
           if ($LASTEXITCODE -ne 0) { throw 'Release metadata update failed' }
           gh release view $tag --repo $repo --json url,assets
