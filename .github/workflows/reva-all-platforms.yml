@@ -115,6 +115,24 @@ jobs:
           fetch-depth: 0
       - name: Verify source
         run: test "$(git rev-parse HEAD)" = "$REV_SHA"
+      - name: Suppress unimplemented BIOS popup in Qt frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("src/platform/qt/Window.cpp")
+          text = path.read_text(encoding="utf-8")
+          needle = "\tconnect(m_controller.get(), &CoreController::unimplementedBiosCall, this, &Window::unimplementedBiosCall);\n"
+          replacement = "\t// RevA custom build: suppress the Qt warning dialog for unimplemented BIOS calls.\n"
+          count = text.count(needle)
+          if count != 1:
+              raise SystemExit(f"Expected exactly one unimplementedBiosCall Qt connection, found {count}")
+          path.write_text(text.replace(needle, replacement, 1), encoding="utf-8")
+          if needle in path.read_text(encoding="utf-8"):
+              raise SystemExit("Qt BIOS warning connection is still present")
+          PY
+          git diff --check
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -153,6 +171,24 @@ jobs:
           fetch-depth: 0
       - name: Verify source
         run: test "$(git rev-parse HEAD)" = "$REV_SHA"
+      - name: Suppress unimplemented BIOS popup in Qt frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("src/platform/qt/Window.cpp")
+          text = path.read_text(encoding="utf-8")
+          needle = "\tconnect(m_controller.get(), &CoreController::unimplementedBiosCall, this, &Window::unimplementedBiosCall);\n"
+          replacement = "\t// RevA custom build: suppress the Qt warning dialog for unimplemented BIOS calls.\n"
+          count = text.count(needle)
+          if count != 1:
+              raise SystemExit(f"Expected exactly one unimplementedBiosCall Qt connection, found {count}")
+          path.write_text(text.replace(needle, replacement, 1), encoding="utf-8")
+          if needle in path.read_text(encoding="utf-8"):
+              raise SystemExit("Qt BIOS warning connection is still present")
+          PY
+          git diff --check
       - name: Install dependencies
         run: |
           brew update
