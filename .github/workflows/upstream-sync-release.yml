@@ -67,9 +67,12 @@ jobs:
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "build=false" >> "$GITHUB_OUTPUT"
             echo "Already released $tag; skip expensive builds."
+          elif [[ "$old" == "$sha" && "${{ github.event_name }}" == "schedule" ]]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream unchanged; scheduled run skips rebuild, even after prior build failure."
           else
             echo "build=true" >> "$GITHUB_OUTPUT"
-            echo "Build requested for $tag."
+            echo "Build requested for $tag (source changed or manually/configuration-triggered run)."
           fi
           printf 'Upstream: %s\nRevision: %s\nSnapshot: %s\n' "$upstream" "$sha" "$tag" >> "$GITHUB_STEP_SUMMARY"
 
