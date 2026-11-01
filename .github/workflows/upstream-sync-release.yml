@@ -1,0 +1,253 @@
+name: Mirror mGBA upstream and publish desktop builds
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+  push:
+    branches: ["0.3"]
+    paths: [".github/workflows/upstream-sync-release.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mgba-official-upstream-snapshot
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Update isolated official master mirror
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    outputs:
+      build: ${{ steps.sync.outputs.build }}
+      sha: ${{ steps.sync.outputs.sha }}
+      tag: ${{ steps.sync.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Fetch upstream and publish safe mirror
+        id: sync
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          upstream="https://github.com/mgba-emu/mgba.git"
+          sha=$(timeout 90 git ls-remote --exit-code "$upstream" refs/heads/master | awk 'NR==1 {print $1}')
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Cannot resolve official upstream master."
+            exit 1
+          fi
+          old=$(git ls-remote origin refs/heads/upstream-master | awk 'NR==1 {print $1}')
+          if [[ "$old" != "$sha" ]]; then
+            git fetch --no-tags "$upstream" refs/heads/master
+            got=$(git rev-parse FETCH_HEAD)
+            test "$got" = "$sha"
+            if [[ -n "$old" ]]; then
+              git fetch --no-tags origin refs/heads/upstream-master
+              if ! git merge-base --is-ancestor "$old" "$sha"; then
+                echo "::error::Upstream diverged or rewrote history; refusing to overwrite existing source mirror."
+                exit 1
+              fi
+            fi
+            git push origin "$sha:refs/heads/upstream-master"
+            echo "Mirrored official $sha"
+          else
+            echo "Official upstream master unchanged at $sha"
+          fi
+          tag="mgba-upstream-${sha:0:12}"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Already released $tag; skip expensive builds."
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "Build requested for $tag."
+          fi
+          printf 'Upstream: %s\nRevision: %s\nSnapshot: %s\n' "$upstream" "$sha" "$tag" >> "$GITHUB_STEP_SUMMARY"
+
+  windows:
+    name: Windows x64 Qt portable ZIP
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: upstream-master
+          persist-credentials: false
+          submodules: recursive
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git zip unzip make ninja
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-qt6-base
+            mingw-w64-x86_64-qt6-multimedia
+            mingw-w64-x86_64-qt6-tools
+            mingw-w64-x86_64-SDL2
+            mingw-w64-x86_64-libzip
+            mingw-w64-x86_64-ffmpeg
+            mingw-w64-x86_64-libepoxy
+            mingw-w64-x86_64-sqlite3
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-lua
+      - name: Configure, build, and package with upstream CPack
+        shell: msys2 {0}
+        env:
+          RELEASE_TAG: ${{ needs.sync.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_QT=ON -DBUILD_SDL=ON -DFORCE_QT_VERSION=6 \
+            -DBUILD_TEST=OFF -DBUILD_SUITE=OFF -DDISTBUILD=ON
+          cmake --build build --parallel 4
+          test -f build/mGBA.exe
+          mkdir -p dist
+          (cd build && cpack -G ZIP -B ../dist)
+          zipfile=$(find dist -maxdepth 1 -type f -name '*.zip' -print -quit)
+          test -n "$zipfile"
+          unzip -l "$zipfile" | grep -F 'mGBA.exe'
+          mv "$zipfile" "dist/mGBA-$RELEASE_TAG-Windows-x64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mgba-windows-x64
+          path: dist/mGBA-*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  linux:
+    name: Linux x64 portable archive (system libraries)
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: upstream-master
+          persist-credentials: false
+          submodules: recursive
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build gcc g++ pkg-config libsdl2-dev \
+            qt6-base-dev qt6-multimedia-dev qt6-tools-dev \
+            libzip-dev libepoxy-dev libsqlite3-dev liblua5.4-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+            libpng-dev zlib1g-dev libelf-dev libedit-dev libopengl-dev
+      - name: Configure, compile and package
+        env:
+          RELEASE_TAG: ${{ needs.sync.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_QT=ON -DBUILD_SDL=ON -DFORCE_QT_VERSION=6 \
+            -DBUILD_TEST=OFF -DBUILD_SUITE=OFF
+          cmake --build build --parallel 3
+          mkdir -p dist
+          (cd build && cpack -G TGZ -B ../dist)
+          pkg=$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)
+          test -n "$pkg"
+          tar -tzf "$pkg" | grep -E '(^|/)(mgba-qt|mGBA)(/|$)' | head -5
+          mv "$pkg" "dist/mGBA-$RELEASE_TAG-Linux-x64.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mgba-linux-x64
+          path: dist/mGBA-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  macos:
+    name: macOS Apple Silicon DMG
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: upstream-master
+          persist-credentials: false
+          submodules: recursive
+      - name: Install build dependencies
+        run: |
+          brew install cmake ninja qt ffmpeg libzip sdl2 libedit lua pkg-config libepoxy
+      - name: Build and assemble macOS application
+        env:
+          RELEASE_TAG: ${{ needs.sync.outputs.tag }}
+        run: |
+          set -euo pipefail
+          qt="$(brew --prefix qt)"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            "-DCMAKE_PREFIX_PATH=$qt" \
+            -DBUILD_QT=ON -DBUILD_SDL=ON -DFORCE_QT_VERSION=6 \
+            -DBUILD_TEST=OFF -DBUILD_SUITE=OFF
+          cmake --build build --parallel 3
+          app=$(find build -type d -name 'mGBA.app' -print -quit)
+          test -n "$app"
+          "$qt/bin/macdeployqt" "$app" -always-overwrite
+          codesign --force --deep --sign - "$app"
+          mkdir -p dist
+          hdiutil create -volname mGBA -srcfolder "$app" -ov -format UDZO \
+            "dist/mGBA-$RELEASE_TAG-macOS-ARM64.dmg"
+          hdiutil verify "dist/mGBA-$RELEASE_TAG-macOS-ARM64.dmg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mgba-macos-arm64
+          path: dist/*.dmg
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish complete three-platform snapshot
+    needs: [sync, windows, linux, macos]
+    if: >-
+      needs.sync.outputs.build == 'true' &&
+      needs.windows.result == 'success' &&
+      needs.linux.result == 'success' &&
+      needs.macos.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mgba-*
+          path: packages
+          merge-multiple: true
+      - name: Verify packages and create prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.sync.outputs.tag }}
+          SOURCE_SHA: ${{ needs.sync.outputs.sha }}
+        run: |
+          set -euo pipefail
+          cd packages
+          test -s "mGBA-$RELEASE_TAG-Windows-x64.zip"
+          test -s "mGBA-$RELEASE_TAG-Linux-x64.tar.gz"
+          test -s "mGBA-$RELEASE_TAG-macOS-ARM64.dmg"
+          sha256sum mGBA-* > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
+          printf 'Unofficial automated mGBA snapshot.\n\nUpstream source: https://github.com/mgba-emu/mgba\nCommit: %s\n\nWindows x64 portable ZIP, Linux x64 archive (requires compatible shared libraries), macOS Apple Silicon DMG (ad-hoc signed, not notarized).\n\nNo game ROMs, BIOS files or copyrighted game assets are provided.\n' "$SOURCE_SHA" > notes.md
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release already exists. Skipping duplicate."
+          else
+            gh release create "$RELEASE_TAG" mGBA-*.zip mGBA-*.tar.gz mGBA-*.dmg SHA256SUMS.txt \
+              --target "$SOURCE_SHA" --title "mGBA official upstream $RELEASE_TAG" \
+              --prerelease --notes-file notes.md
+          fi
