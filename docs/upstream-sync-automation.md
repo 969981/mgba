@@ -19,7 +19,7 @@ Source of truth: https://github.com/mgba-emu/mgba.git
 - On a new upstream master SHA, it fetches and **fast-forwards only** the dedicated `upstream-master` branch. History divergence fails rather than silently destroying work.
 - If a GitHub Release tag `mgba-upstream-<first 12 SHA characters>` already exists, no build is started.
 - If the release is missing, Windows, Linux, and macOS run separate builds from the mirrored revision.
-- A snapshot Release is published only after **all three** build jobs finish successfully, and includes SHA256 checksums. Failed packages do not create incomplete releases. A subsequent scheduled run retries if no Release exists.
+- A snapshot Release is published only after **all three** build jobs finish successfully, and includes SHA256 checksums. Failed packages do not create incomplete releases. Scheduled checks do not repeatedly rebuild an unchanged upstream SHA after a failure; use **Run workflow** to retry, or the next upstream source change will trigger a build.
 - Older Releases such as `revA-20260930` are not deleted or modified.
 
 ## Packaging details
