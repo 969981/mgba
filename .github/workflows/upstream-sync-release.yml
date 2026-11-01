@@ -146,8 +146,8 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build gcc g++ pkg-config libsdl2-dev \
             qt6-base-dev qt6-multimedia-dev qt6-tools-dev \
-            libzip-dev libepoxy-dev libsqlite3-dev liblua5.4-dev \
-            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+            libzip-dev libzip-tools libepoxy-dev libsqlite3-dev liblua5.4-dev \
+            libavcodec-dev libavformat-dev libavfilter-dev libavutil-dev libswscale-dev \
             libpng-dev zlib1g-dev libelf-dev libedit-dev libopengl-dev
       - name: Configure, compile and package
         env:
