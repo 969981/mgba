@@ -2,7 +2,7 @@ name: Mirror mGBA upstream and publish desktop builds
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "17,47 * * * *"
   workflow_dispatch:
   push:
     branches: ["0.3"]
@@ -12,7 +12,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: mgba-official-upstream-snapshot
+  # A new concurrency group releases fixed workflows from old runs blocked on an invalid runner label.
+  group: mgba-official-upstream-snapshot-runnerfix-v2
   cancel-in-progress: false
 
 jobs:
@@ -107,7 +108,7 @@ jobs:
             mingw-w64-x86_64-sqlite3
             mingw-w64-x86_64-pkgconf
             mingw-w64-x86_64-lua
-      - name: Configure, build, and package with upstream CPack
+      - name: Configure, build, and package portable Qt ZIP
         shell: msys2 {0}
         env:
           RELEASE_TAG: ${{ needs.sync.outputs.tag }}
@@ -117,13 +118,31 @@ jobs:
             -DBUILD_QT=ON -DBUILD_SDL=ON -DFORCE_QT_VERSION=6 \
             -DBUILD_TEST=OFF -DBUILD_SUITE=OFF -DDISTBUILD=ON
           cmake --build build --parallel 4
-          test -f build/mGBA.exe
-          mkdir -p dist
-          (cd build && cpack -G ZIP -B ../dist)
-          zipfile=$(find dist -maxdepth 1 -type f -name '*.zip' -print -quit)
-          test -n "$zipfile"
-          unzip -l "$zipfile" | grep -F 'mGBA.exe'
-          mv "$zipfile" "dist/mGBA-$RELEASE_TAG-Windows-x64.zip"
+          test -s build/mGBA.exe
+          # Upstream CPack calls deploy-win.sh with an unsupported Qt6 --no-svg
+          # argument, and previously failed when ntldd was unavailable.
+          # Bundle the successfully linked Qt executable directly instead.
+          mkdir -p dist/windows
+          cp build/mGBA.exe dist/windows/
+          find build -maxdepth 1 -type f -iname '*.dll' -exec cp -n {} dist/windows/ \;
+          deploy_tool="$(command -v windeployqt6.exe || command -v windeployqt.exe || command -v windeployqt)"
+          "$deploy_tool" --release --dir dist/windows dist/windows/mGBA.exe
+          # Collect MinGW/FFmpeg/SDL runtime DLLs not pulled in by Qt deployment.
+          for pass in 1 2 3 4; do
+            find dist/windows -type f \( -iname '*.exe' -o -iname '*.dll' \) -print0 \
+              | xargs -0 -r ldd 2>/dev/null \
+              | awk '/\/mingw64\/bin\// { print $3 }' | sort -u \
+              | while IFS= read -r dependency; do
+                  test -f "$dependency" && cp -n "$dependency" dist/windows/ || true
+                done
+          done
+          for file in LICENSE LICENSE.txt README.md; do
+            if test -f "$file"; then cp "$file" dist/windows/; fi
+          done
+          printf '[Paths]\nPlugins = plugins\n' > dist/windows/qt.conf
+          (cd dist/windows && zip -qr "../mGBA-$RELEASE_TAG-Windows-x64.zip" .)
+          test -s "dist/mGBA-$RELEASE_TAG-Windows-x64.zip"
+          unzip -l "dist/mGBA-$RELEASE_TAG-Windows-x64.zip" | grep -F 'mGBA.exe'
       - uses: actions/upload-artifact@v4
         with:
           name: mgba-windows-x64
@@ -159,7 +178,10 @@ jobs:
           set -euo pipefail
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_QT=ON -DBUILD_SDL=ON -DFORCE_QT_VERSION=6 \
-            -DBUILD_TEST=OFF -DBUILD_SUITE=OFF
+            -DBUILD_TEST=OFF -DBUILD_SUITE=OFF -DSKIP_GIT=ON
+          # Upstream Qt CMakeLists expands an empty RELEASE_TAGS without quoting,
+          # causing string(REPLACE) to fail in shallow CI checkouts. SKIP_GIT
+          # bypasses optional AppStream git-tag enumeration without source edits.
           cmake --build build --parallel 3
           mkdir -p dist
           (cd build && cpack -G TGZ -B ../dist)
@@ -178,7 +200,8 @@ jobs:
     name: macOS Apple Silicon DMG
     needs: sync
     if: needs.sync.outputs.build == 'true'
-    runs-on: macos-15-arm64
+    # GitHub-hosted Apple Silicon uses the macos-15 workflow label.
+    runs-on: macos-15
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
